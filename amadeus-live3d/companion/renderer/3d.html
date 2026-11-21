@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Amadeus 3D</title>
+<style>
+  :root { --bg: #141319; --fg: #e8e6f0; --accent: #b5a3f5; --muted: #8b8698; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; color: var(--fg); }
+  #view { position: fixed; inset: 0; }
+  #view canvas { display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: var(--muted); pointer-events: none;
+    background: rgba(20,19,25,.6); border: 1px solid rgba(255,255,255,.08);
+    padding: 4px 12px; border-radius: 999px; white-space: nowrap;
+  }
+  #err {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    font-size: 13px; color: #f38f9c; display: none; text-align: center; max-width: 80%;
+    background: rgba(20,19,25,.7); padding: 12px 16px; border-radius: 10px;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./three/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="view"></div>
+  <div id="hud" style="display:none">Загрузка…</div>
+  <div id="err"></div>
+  <script>
+    window.addEventListener('error', (e) => console.error('[3d] page error:', e.message, e.filename, e.lineno));
+    window.addEventListener('unhandledrejection', (e) => console.error('[3d] unhandled rejection:', e.reason));
+  </script>
+  <script type="module">
+    console.log('[3d] module starting');
+    (async () => {
+      try {
+        const THREE = await import('three');
+        const { GLTFLoader } = await import('./three/loaders/GLTFLoader.js');
+        const { FBXLoader } = await import('./three/loaders/FBXLoader.js');
+        const { OBJLoader } = await import('./three/loaders/OBJLoader.js');
+        console.log('[3d] imports ok');
+
+        const view = document.getElementById('view');
+        const hud = document.getElementById('hud');
+        const errBox = document.getElementById('err');
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 200);
+        camera.position.set(0, 0.6, 2.6);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setPixelRatio(2); // supersample 2x — crisper edges, less aliasing
+        renderer.setClearColor(0x000000, 0); // fully transparent clear — model floats on the desktop, no box
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping; // Kyndred-style filmic curve
+        renderer.toneMappingExposure = 0.95;
+        view.appendChild(renderer.domElement);
+
+        // Kyndred-style lighting: directional ambient (hemisphere = fake IBL) + soft three-point.
+        const hemi = new THREE.HemisphereLight(0xf0f2ff, 0x383a52, 0.55); // sky cool-white / ground dark blue
+        scene.add(hemi);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.10)); // base fill to lift blacks
+        const key = new THREE.DirectionalLight(0xffffff, 1.2);
+        key.position.set(2, 3, 3);
+        scene.add(key);
+        const rim = new THREE.DirectionalLight(0xffffff, 0.6);
+        rim.position.set(-2, 1, -2);
+        scene.add(rim);
+
+        let model = null;
+        let bones = new Map();     // name -> THREE.Bone
+        let baseRot = new Map();   // name -> Euler copy
+        let autoRotate = false;
+        let manualPose = new Map(); // name -> {x,y,z} (set by set_bone / agent)
+        let breathing = true;       // idle breathing on/off
+        let speaking = false;       // talk animation on/off
+        let breathT = 0;            // continuous phase (radians)
+        let gesture = null;         // {name, t0} one-shot gesture
+
+        // VRM blendshape (morph) animation state.
+        let expressions = {};       // name -> [{mesh, morphIndex, weight}]
+        let allMorphSlots = [];     // [{mesh, morphIndex}] — zeroed each frame
+        let emotionTargets = {};    // continuous emotion vector: expression name -> target weight 0..1
+        let emotionWeights = {};    // expression name -> lerped weight (smoothed each frame)
+        let blinkNext = 0;          // timestamp of next blink
+        let blinkT = -1;            // -1 = not blinking, else seconds since blink start
+        let mouthT = 0;             // mouth animation phase
+        let lookX = 0, lookY = 0;   // cursor position normalized -1..1 (eye look-at)
+        let sleeping = false;       // sleep idle: arms down, eyes closed, no motion
+        let lastActivity = 0;       // timestamp of last agent interaction (auto-sleep lifecycle)
+        const IDLE_SLEEP_TIMEOUT = 8; // seconds of inactivity before drifting back to sleep
+        // Layer weights, exponentially smoothed toward targets each frame (blend tree).
+        let wBreath = 0, wSpeech = 0, wSleep = 0, wLook = 0;
+        // Phoneme lip-sync state: the spoken text drives the mouth morphs (visemes), not a sine wave.
+        let speechText = '';         // current text being lip-synced
+        let visemeSeq = [];          // [{v, dur}] viseme sequence computed from text
+        let visemeClock = 0;         // seconds since this utterance started
+
+        function fitCamera(obj) {
+          const box = new THREE.Box3().setFromObject(obj);
+          if (box.isEmpty()) return;
+          const size = box.getSize(new THREE.Vector3());
+          const center = box.getCenter(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.y, size.z, 0.01);
+          const dist = maxDim * 1.6;
+          camera.position.set(center.x, center.y + maxDim * 0.15, center.z + dist);
+          camera.near = maxDim / 100;
+          camera.far = maxDim * 100;
+          camera.lookAt(center.x, center.y, center.z);
+          camera.updateProjectionMatrix();
+        }
+
+        function collectBones(root) {
+          bones.clear(); baseRot.clear();
+          root.traverse((o) => {
+            if (o.isBone) {
+              bones.set(o.name, o);
+              baseRot.set(o.name, { x: o.rotation.x, y: o.rotation.y, z: o.rotation.z });
+            }
+          });
+        }
+
+        function setHud(text) { hud.textContent = text; hud.style.display = text ? 'block' : 'none'; }
+        function setErr(text) { errBox.textContent = text; errBox.style.display = text ? 'block' : 'none'; }
+
+        // --- MToon-like toon shading: soft ramp + dark silhouette outline ---
+        // VRoid ships MToon (ramp shading + outline), which three.js loads as flat PBR. We
+        // approximate it: convert every mesh to MeshToonMaterial with a soft 4-band ramp and
+        // add a Fresnel silhouette outline in the fragment shader (safe with skinning + morphs).
+        function makeToonGradient() {
+          // MToon-like ramp: cool blue-purple SHADOW → neutral → white LIGHT.
+          // Colored shadow (VRoid's "shade color") gives depth instead of flat gray.
+          const N = 64;
+          const data = new Uint8Array(N * 4);
+          const shadow = [0xa6, 0xab, 0xcf]; // light cool lavender (MToon shade — bright, not dark)
+          const mid    = [0xc9, 0xcc, 0xe4]; // soft neutral lavender
+          const light  = [0xff, 0xff, 0xff]; // full light
+          const lerp = (a, b, t) => Math.round(a + (b - a) * t);
+          for (let i = 0; i < N; i++) {
+            const t = i / (N - 1);
+            let r, g, b;
+            if (t < 0.5) { const u = t / 0.5; r = lerp(shadow[0], mid[0], u); g = lerp(shadow[1], mid[1], u); b = lerp(shadow[2], mid[2], u); }
+            else { const u = (t - 0.5) / 0.5; r = lerp(mid[0], light[0], u); g = lerp(mid[1], light[1], u); b = lerp(mid[2], light[2], u); }
+            data[i * 4] = r; data[i * 4 + 1] = g; data[i * 4 + 2] = b; data[i * 4 + 3] = 255;
+          }
+          const tex = new THREE.DataTexture(data, N, 1, THREE.RGBAFormat);
+          tex.minFilter = THREE.LinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.generateMipmaps = false;
+          tex.needsUpdate = true;
+          return tex;
+        }
+        const toonGradient = makeToonGradient();
+        const OUTLINE_COLOR = new THREE.Color(0x1a1a28);
+
+        function applyToonShading(root) {
+          root.traverse((o) => {
+            if (!o.isMesh) return;
+            const src = Array.isArray(o.material) ? o.material : [o.material];
+            const out = src.map((m) => {
+              const t = new THREE.MeshToonMaterial({
+                color: (m && m.color) ? m.color.clone() : new THREE.Color(0xffffff),
+                map: (m && m.map) ? m.map : null,
+                gradientMap: toonGradient,
+                transparent: !!(m && m.transparent),
+                alphaMap: (m && m.alphaMap) ? m.alphaMap : null,
+                side: (m && m.side !== undefined) ? m.side : THREE.FrontSide,
+                skinning: true,
+                morphTargets: true,
+              });
+              // Dark anime silhouette outline via screen-space normal (derivatives of vViewPosition).
+              t.onBeforeCompile = (shader) => {
+                shader.uniforms.uOutline = { value: OUTLINE_COLOR };
+                shader.uniforms.uOutlineStrength = { value: 1.0 };
+                if (shader.fragmentShader.indexOf('#include <tonemapping_fragment>') === -1) return;
+                shader.fragmentShader = shader.fragmentShader
+                  .replace('#include <common>', '#include <common>\nuniform vec3 uOutline;\nuniform float uOutlineStrength;')
+                  .replace('#include <tonemapping_fragment>',
+                    'vec3 _fdx = dFdx(vViewPosition);\n' +
+                    'vec3 _fdy = dFdy(vViewPosition);\n' +
+                    'vec3 _faceNormal = normalize(cross(_fdx, _fdy));\n' +
+                    'float fresnel = 1.0 - abs(dot(_faceNormal, normalize(-vViewPosition)));\n' +
+                    'float outlineF = smoothstep(0.4, 0.72, fresnel);\n' +
+                    'gl_FragColor.rgb = mix(gl_FragColor.rgb, uOutline, outlineF * uOutlineStrength);\n' +
+                    '#include <tonemapping_fragment>');
+              };
+              return t;
+            });
+            o.material = (out.length === 1) ? out[0] : out;
+          });
+        }
+
+        function loadByUrl(url) {
+          const lower = url.split('?')[0].toLowerCase();
+          const ext = lower.slice(lower.lastIndexOf('.') + 1);
+          return new Promise((resolve, reject) => {
+            if (ext === 'fbx') { new FBXLoader().loadAsync(url).then((o) => resolve({ root: o, gltf: null })).catch(reject); }
+            else if (ext === 'obj') { new OBJLoader().loadAsync(url).then((o) => resolve({ root: o, gltf: null })).catch(reject); }
+            else { new GLTFLoader().loadAsync(url).then((g) => resolve({ root: (g.scene || g), gltf: g })).catch(reject); }
+          });
+        }
+
+        function parseVrm(gltf) {
+          expressions = {}; allMorphSlots = []; emotionTargets = {}; emotionWeights = {};
+          try {
+            const json = gltf.parser && gltf.parser.json;
+            const preset = json && json.extensions && json.extensions.VRMC_vrm && json.extensions.VRMC_vrm.expressions && json.extensions.VRMC_vrm.expressions.preset;
+            if (!preset) return;
+            const meshes = json.meshes || [];
+            const nodes = json.nodes || [];
+
+            // Build morphName -> {mesh, morphIndex} by traversing the loaded scene
+            // (meshes may be split across primitives, so resolve by name, not node index).
+            const morphDict = new Map();
+            model.traverse((o) => {
+              if (o.isMesh && o.morphTargetDictionary) {
+                for (const [name, idx] of Object.entries(o.morphTargetDictionary)) {
+                  if (!morphDict.has(name)) morphDict.set(name, { mesh: o, morphIndex: idx });
+                }
+              }
+            });
+
+            for (const [name, expr] of Object.entries(preset)) {
+              const morphs = [];
+              for (const bind of (expr.morphTargetBinds || [])) {
+                const node = nodes[bind.node];
+                const meshIndex = node && node.mesh;
+                if (meshIndex === undefined) continue;
+                const targetNames = (meshes[meshIndex] && meshes[meshIndex].extras && meshes[meshIndex].extras.targetNames) || [];
+                const morphName = targetNames[bind.index];
+                if (!morphName) continue;
+                const slot = morphDict.get(morphName);
+                if (!slot) continue;
+                morphs.push({ mesh: slot.mesh, morphIndex: slot.morphIndex, weight: bind.weight == null ? 1 : bind.weight });
+                allMorphSlots.push({ mesh: slot.mesh, morphIndex: slot.morphIndex });
+              }
+              if (morphs.length) expressions[name] = morphs;
+            }
+            if (Object.keys(expressions).length) console.log('[3d] vrm expressions:', Object.keys(expressions).join(', '));
+          } catch (e) {
+            console.error('[3d] vrm parse:', e);
+          }
+        }
+
+        function addMorph(exprName, weight) {
+          const morphs = expressions[exprName];
+          if (!morphs || !weight) return;
+          for (const m of morphs) m.mesh.morphTargetInfluences[m.morphIndex] += weight * m.weight;
+        }
+
+        // Set a continuous emotion vector: {happy:0.8, surprised:0.3, ...}. Multiple expressions
+        // blend simultaneously (each morph lerps toward its own weight), so the face can express
+        // mixed emotion like "surprised + happy" instead of one discrete switch. A context-aware
+        // gesture is auto-triggered for the DOMINANT emotion when it's strong enough.
+        function setEmotion(vec) {
+          if (!vec || typeof vec !== 'object') { emotionTargets = {}; return true; }
+          const next = {};
+          for (const k of Object.keys(vec)) {
+            const w = Number(vec[k]);
+            if (isFinite(w) && expressions[k]) next[k] = Math.max(0, Math.min(1, w));
+          }
+          // Normalize so the strongest morph drives at full weight (avoids overdriving).
+          let max = 0;
+          for (const w of Object.values(next)) if (w > max) max = w;
+          if (max > 1) for (const k of Object.keys(next)) next[k] /= max;
+          emotionTargets = next;
+          if (Object.keys(next).length) wake();   // expressing emotion = agent interaction
+          // Context-aware gesture: pick the dominant emotion and fire its gesture (with threshold).
+          let dom = '', domW = 0;
+          for (const [k, w] of Object.entries(next)) if (w > domW) { dom = k; domW = w; }
+          if (dom && EMOTION_GESTURES[dom] && domW >= EMOTION_GESTURE_MIN && !sleeping) playGesture(EMOTION_GESTURES[dom]);
+          return true;
+        }
+
+        function setExpression(name) {
+          if (name && !expressions[name]) return false;
+          return setEmotion(name ? { [name]: 1 } : {});
+        }
+
+        function listExpressions() { return Object.keys(expressions); }
+
+        async function loadModel(url) {
+          setErr('');
+          if (model) { scene.remove(model); model = null; }
+          bones.clear(); baseRot.clear();
+          manualPose.clear(); gesture = null;
+          setHud('Загрузка модели…');
+          try {
+            const { root, gltf } = await loadByUrl(url);
+            model = root;
+            scene.add(root);
+            applyToonShading(root);
+            collectBones(root);
+            if (gltf) await parseVrm(gltf);
+            fitCamera(root);
+            setHud('');
+            sleeping = true;            // start in idle/sleep until the agent interacts
+            lastActivity = performance.now();
+            return { ok: true, bones: bones.size, expressions: listExpressions() };
+          } catch (e) {
+            console.error('[3d] load failed:', e && e.message ? e.message : e);
+            setErr('Ошибка загрузки: ' + (e && e.message ? e.message : String(e)));
+            setHud('');
+            return { ok: false, error: (e && e.message) ? e.message : String(e) };
+          }
+        }
+
+        function setBone(name, rx, ry, rz) {
+          if (!bones.has(name)) return false;
+          manualPose.set(name, { x: rx || 0, y: ry || 0, z: rz || 0 });
+          wake();   // direct pose control = agent interaction
+          return true;
+        }
+
+        function resetPose() {
+          manualPose.clear();
+          gesture = null;
+          wake();
+        }
+
+        function listBones() { return Array.from(bones.keys()); }
+
+        // Resolve a bone by a list of candidate substrings (case-insensitive), so gestures
+        // work on VRM (J_Bip_*) and generic rigs (upper_armR / RightUpperArm / ...) alike.
+        function findBone(patterns) {
+          for (const name of bones.keys()) {
+            const lower = name.toLowerCase();
+            for (const p of patterns) {
+              if (lower.indexOf(p.toLowerCase()) !== -1) return name;
+            }
+          }
+          return null;
+        }
+
+        // Each frame: bone.rotation = baseRot + manualPose (override) else baseRot + animPose.
+        // If the agent explicitly posed a bone (manualPose), auto-animation skips it.
+        function applyPose(anim) {
+          for (const [name, b] of bones) {
+            const base = baseRot.get(name);
+            const m = manualPose.get(name);
+            if (m) {
+              b.rotation.set(base.x + m.x, base.y + m.y, base.z + m.z);
+            } else {
+              const a = anim.get(name);
+              b.rotation.set(
+                base.x + (a ? a.x : 0),
+                base.y + (a ? a.y : 0),
+                base.z + (a ? a.z : 0)
+              );
+            }
+          }
+        }
+
+        function setScale(s) {
+          if (model && typeof s === 'number' && s > 0) model.scale.setScalar(s);
+        }
+
+        function setAutoRotate(on) { autoRotate = !!on; }
+
+        function resize() {
+          const w = window.innerWidth, h = window.innerHeight;
+          renderer.setSize(w, h, true); // keep CSS size = window while buffer is supersampled (2x)
+          camera.aspect = w / Math.max(h, 1);
+          camera.updateProjectionMatrix();
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Track the cursor for eye look-at (window ignores clicks but still gets mousemove).
+        window.addEventListener('mousemove', (e) => {
+          lookX = (e.clientX / Math.max(window.innerWidth, 1)) * 2 - 1;
+          lookY = (e.clientY / Math.max(window.innerHeight, 1)) * 2 - 1;
+        });
+        window.addEventListener('mouseleave', () => { lookX = 0; lookY = 0; });
+
+        const HEAD = ['j_bip_c_head', 'head', 'neck'];
+        const NECK = ['j_bip_c_neck', 'neck'];
+        const CHEST = ['j_bip_c_chest', 'chest', 'j_bip_c_spine'];
+        const SPINE = ['j_bip_c_spine', 'spine', 'j_bip_c_hips'];
+        const ARM_R_UP = ['j_bip_r_upperarm', 'upper_armr', 'upper_arm_r', 'rightupperarm', 'right_upper_arm'];
+        const ARM_R_LO = ['j_bip_r_lowerarm', 'forearmr', 'forearm_r', 'j_bip_r_forearm', 'rightlowerarm', 'right_lower_arm'];
+        const ARM_L_UP = ['j_bip_l_upperarm', 'upper_arml', 'upper_arm_l', 'leftupperarm', 'left_upper_arm'];
+        const ARM_L_LO = ['j_bip_l_lowerarm', 'forearml', 'forearm_l', 'j_bip_l_forearm', 'leftlowerarm', 'left_lower_arm'];
+        const HIP = ['j_bip_c_hips', 'hips', 'hip', 'waist'];
+        const THIGH_R = ['j_bip_r_upperleg', 'upper_leg_r', 'rightupperleg', 'right_upper_leg', 'thigh_r', 'j_bip_r_leg'];
+        const THIGH_L = ['j_bip_l_upperleg', 'upper_leg_l', 'leftupperleg', 'left_upper_leg', 'thigh_l', 'j_bip_l_leg'];
+        const SHIN_R = ['j_bip_r_lowerleg', 'lower_leg_r', 'rightlowerleg', 'right_lower_leg', 'shin_r'];
+        const SHIN_L = ['j_bip_l_lowerleg', 'lower_leg_l', 'leftlowerleg', 'left_lower_leg', 'shin_l'];
+        const EYE_L = ['l_faceeye', 'eye_l', 'left_eye', 'lefteye', 'eye.left'];
+        const EYE_R = ['r_faceeye', 'eye_r', 'right_eye', 'righteye', 'eye.right'];
+
+        const GESTURES = { wave: 2.2, nod: 1.6, shake: 1.6, point: 1.6, bow: 2.0, stretch: 2.5, clap: 2.0, thumbs_up: 2.0, salute: 2.0, dance: 4.0, shrug: 1.6, look_around: 2.2 };
+        // Auto-gesture triggered when an emotion expression is set.
+        const EMOTION_GESTURES = { happy: null, angry: 'shake', sad: 'bow', surprised: null, relaxed: null, neutral: null };
+        const EMOTION_GESTURE_MIN = 0.6; // dominant-emotion weight threshold to fire the gesture
+
+        // Blend tree: each layer produces a bone→delta Map; final anim = rest + Σ(layer·weight).
+        // Layers: rest (base, weight 1) · breath · speech · gesture · sleep · look.
+        function computeAnim(now) {
+          const rest = new Map();
+          const breath = new Map();
+          const speech = new Map();
+          const sleep = new Map();
+          const look = new Map();
+          const emotionBody = new Map();
+          let gestureW = 0, gestureMap = null;
+
+          // --- rest (base): natural arm hang from T-pose ---
+          if (bones.size) {
+            const raUp = findBone(ARM_R_UP), laUp = findBone(ARM_L_UP);
+            if (raUp) rest.set(raUp, { x: 0, y: 0, z: 0.45 });
+            if (laUp) rest.set(laUp, { x: 0, y: 0, z: -0.45 });
+          }
+
+          // --- breath ---
+          if (bones.size) {
+            const head = findBone(HEAD), chest = findBone(CHEST), spine = findBone(SPINE);
+            const s = Math.sin(breathT), s2 = Math.sin(breathT * 1.2 + 0.6);
+            if (spine) breath.set(spine, { x: s * 0.045, y: 0, z: 0 });
+            if (chest) breath.set(chest, { x: s2 * 0.055, y: 0, z: 0 });
+            if (head) breath.set(head, { x: s2 * 0.032, y: 0, z: 0 });
+          }
+
+          // --- speech ---
+          if (bones.size) {
+            const head = findBone(HEAD), neck = findBone(NECK), chest = findBone(CHEST);
+            const t = breathT;
+            if (head) speech.set(head, { x: Math.sin(t * 2.4) * 0.12, y: Math.sin(t * 1.7) * 0.11, z: Math.sin(t * 2.1) * 0.07 });
+            if (neck) speech.set(neck, { x: Math.sin(t * 2.0) * 0.07, y: 0, z: 0 });
+            if (chest) speech.set(chest, { x: Math.sin(t * 1.9) * 0.035, y: 0, z: 0 });
+          }
+
+          // --- sleep (delta on top of rest: arms from hang → fully down, head bowed) ---
+          if (bones.size) {
+            const raUp = findBone(ARM_R_UP), laUp = findBone(ARM_L_UP);
+            const head = findBone(HEAD), spine = findBone(SPINE);
+            if (raUp) sleep.set(raUp, { x: 0, y: 0, z: 1.05 });
+            if (laUp) sleep.set(laUp, { x: 0, y: 0, z: -1.05 });
+            if (head) sleep.set(head, { x: 0.4, y: 0, z: 0 });
+            if (spine) sleep.set(spine, { x: 0.12, y: 0, z: 0 });
+          }
+
+          // --- eye look-at ---
+          if (bones.size && (lookX || lookY)) {
+            const eyeL = findBone(EYE_L), eyeR = findBone(EYE_R);
+            const yaw = lookX * 0.18, pitch = -lookY * 0.14;
+            if (eyeL) look.set(eyeL, { x: pitch, y: yaw, z: 0 });
+            if (eyeR) look.set(eyeR, { x: pitch, y: yaw, z: 0 });
+          }
+
+          // --- emotion body language: each emotion drives a natural human-like posture ---
+          // (amplitudes are scaled by the smoothed emotion weights, so they fade in/out gently).
+          const wHap = emotionWeights['happy'] || 0;
+          const wRel = emotionWeights['relaxed'] || 0;
+          const wAng = emotionWeights['angry'] || 0;
+          const wSad = emotionWeights['sad'] || 0;
+          const wSur = emotionWeights['surprised'] || 0;
+          const tE = (now / 1000) * 2 * Math.PI;
+          if (bones.size) {
+            const chest = findBone(CHEST), head = findBone(HEAD), spine = findBone(SPINE);
+            const raUp = findBone(ARM_R_UP), laUp = findBone(ARM_L_UP);
+            const accum = (m, n, dx, dy, dz) => {
+              if (!n) return;
+              const e = m.get(n) || { x: 0, y: 0, z: 0 };
+              m.set(n, { x: e.x + dx, y: e.y + dy, z: e.z + dz });
+            };
+            // happy / relaxed → laugh rhythm: torso bounce + head bob
+            const laughW = wHap + wRel * 0.5;
+            if (laughW > 0.01) {
+              const bounce = Math.max(0, Math.sin(tE * 2.2)) * laughW;
+              accum(emotionBody, spine, bounce * 0.05, 0, 0);
+              accum(emotionBody, chest, bounce * 0.07, 0, 0);
+              accum(emotionBody, head, -bounce * 0.06, 0, 0);
+            }
+            // angry → tense: head juts forward, shoulders rise, faint tremble
+            if (wAng > 0.01) {
+              const tremble = Math.sin(tE * 6.0) * 0.012 * wAng;
+              accum(emotionBody, head, 0.11 * wAng + tremble, 0, 0);
+              accum(emotionBody, chest, -0.04 * wAng, 0, 0);
+              accum(emotionBody, raUp, 0, 0, -0.16 * wAng);
+              accum(emotionBody, laUp, 0, 0, 0.16 * wAng);
+            }
+            // sad → droop: head bows, shoulders slump, slow sway
+            if (wSad > 0.01) {
+              const sway = Math.sin(tE * 0.6) * 0.03 * wSad;
+              accum(emotionBody, head, 0.2 * wSad, sway, 0);
+              accum(emotionBody, spine, 0.12 * wSad, 0, 0);
+              accum(emotionBody, chest, 0.07 * wSad, 0, 0);
+            }
+            // surprised → head pulls back, chest opens (still, wide)
+            if (wSur > 0.01) {
+              accum(emotionBody, head, -0.11 * wSur, 0, 0);
+              accum(emotionBody, chest, -0.04 * wSur, 0, 0);
+            }
+          }
+
+          // --- gesture (one-shot, envelope weight sin(π·p)) ---
+          if (gesture && !sleeping) {
+            const g = gesture.name;
+            const p = Math.min((now - gesture.t0) / ((GESTURES[g] || 1.6) * 1000), 1);
+            gestureW = Math.sin(p * Math.PI);
+            gestureMap = new Map();
+            const head = findBone(HEAD), spine = findBone(SPINE), chest = findBone(CHEST);
+            const hip = findBone(HIP);
+            const raUp = findBone(ARM_R_UP), raLo = findBone(ARM_R_LO);
+            const laUp = findBone(ARM_L_UP), laLo = findBone(ARM_L_LO);
+            const thighR = findBone(THIGH_R), thighL = findBone(THIGH_L);
+            const shinR = findBone(SHIN_R), shinL = findBone(SHIN_L);
+            if (g === 'wave') {
+              if (raUp) gestureMap.set(raUp, { x: 0, y: 0, z: -2.0 });
+              if (raLo) gestureMap.set(raLo, { x: 0, y: 0, z: -1.0 * Math.sin(p * Math.PI * 5) });
+            } else if (g === 'nod') {
+              if (head) gestureMap.set(head, { x: 0.28 * Math.sin(p * Math.PI * 4), y: 0, z: 0 });
+            } else if (g === 'shake') {
+              if (head) gestureMap.set(head, { x: 0, y: 0.32 * Math.sin(p * Math.PI * 4), z: 0 });
+            } else if (g === 'point') {
+              if (raUp) gestureMap.set(raUp, { x: -0.9, y: 0, z: -0.25 });
+              if (raLo) gestureMap.set(raLo, { x: -0.4, y: 0, z: 0 });
+            } else if (g === 'bow') {
+              if (spine) gestureMap.set(spine, { x: 0.45, y: 0, z: 0 });
+            } else if (g === 'stretch') {
+              // both arms reach straight up, head tilts back
+              if (raUp) gestureMap.set(raUp, { x: 0, y: 0, z: -2.0 });
+              if (laUp) gestureMap.set(laUp, { x: 0, y: 0, z: 2.0 });
+              if (head) gestureMap.set(head, { x: -0.12, y: 0, z: 0 });
+            } else if (g === 'clap') {
+              // hands come together in front, rhythmic in-out bounce
+              const bounce = Math.sin(p * Math.PI * 6);
+              if (raUp) gestureMap.set(raUp, { x: -0.7, y: 0, z: -0.2 });
+              if (raLo) gestureMap.set(raLo, { x: -1.5, y: 0, z: 0 });
+              if (laUp) gestureMap.set(laUp, { x: -0.7, y: 0, z: 0.2 });
+              if (laLo) gestureMap.set(laLo, { x: -1.5, y: 0, z: 0 });
+              if (chest) gestureMap.set(chest, { x: -0.06 * bounce, y: 0, z: 0 });
+            } else if (g === 'thumbs_up') {
+              if (raUp) gestureMap.set(raUp, { x: -0.3, y: 0, z: -1.6 });
+              if (raLo) gestureMap.set(raLo, { x: 0, y: 0, z: -0.3 });
+            } else if (g === 'salute') {
+              if (raUp) gestureMap.set(raUp, { x: 0, y: 0, z: -1.2 });
+              if (raLo) gestureMap.set(raLo, { x: 0, y: 0, z: -1.7 });
+            } else if (g === 'dance') {
+              // Full-body groove: hip sway + bent-elbow arm pump + marching legs
+              const t = (now / 1000) * 2 * Math.PI * 2;   // 2 Hz ≈ 120 BPM
+              const b1 = Math.sin(t);
+              const b2 = Math.sin(t * 2 + 0.7);
+              if (hip) gestureMap.set(hip, { x: 0, y: 0.24 * b1, z: 0.1 * b2 });
+              if (spine) gestureMap.set(spine, { x: 0.05 * b2, y: 0.18 * b1, z: 0 });
+              if (chest) gestureMap.set(chest, { x: 0.04 * b2, y: -0.14 * b1, z: 0 });
+              if (head) gestureMap.set(head, { x: 0.05 * b1, y: 0.16 * b2, z: 0 });
+              if (raUp) gestureMap.set(raUp, { x: 0, y: 0, z: -0.3 - 0.9 * b1 });
+              if (raLo) gestureMap.set(raLo, { x: 0, y: 0, z: -1.0 - 0.3 * b1 });
+              if (laUp) gestureMap.set(laUp, { x: 0, y: 0, z: 0.3 - 0.9 * b1 });
+              if (laLo) gestureMap.set(laLo, { x: 0, y: 0, z: 1.0 - 0.3 * b1 });
+              if (thighR) gestureMap.set(thighR, { x: -0.6 * Math.max(0, b1), y: 0, z: 0 });
+              if (shinR) gestureMap.set(shinR, { x: 0.4 * Math.max(0, b1), y: 0, z: 0 });
+              if (thighL) gestureMap.set(thighL, { x: -0.6 * Math.max(0, -b1), y: 0, z: 0 });
+              if (shinL) gestureMap.set(shinL, { x: 0.4 * Math.max(0, -b1), y: 0, z: 0 });
+            } else if (g === 'shrug') {
+              if (raUp) gestureMap.set(raUp, { x: 0, y: 0, z: -0.3 });
+              if (raLo) gestureMap.set(raLo, { x: 0, y: 0, z: -0.6 });
+              if (laUp) gestureMap.set(laUp, { x: 0, y: 0, z: 0.3 });
+              if (laLo) gestureMap.set(laLo, { x: 0, y: 0, z: 0.6 });
+              if (head) gestureMap.set(head, { x: 0, y: 0.12, z: 0 });
+            } else if (g === 'look_around') {
+              if (head) gestureMap.set(head, { x: 0, y: 0.7 * Math.sin(p * Math.PI * 4), z: 0 });
+            }
+            if (p >= 1) gesture = null;
+          }
+
+          // --- blend: rest (weight 1) + each layer × its smoothed weight ---
+          const out = new Map();
+          for (const [name, d] of rest) out.set(name, { x: d.x, y: d.y, z: d.z });
+          const addLayer = (map, w) => {
+            if (!map || w <= 0.001) return;
+            for (const [name, d] of map) {
+              let o = out.get(name);
+              if (!o) { o = { x: 0, y: 0, z: 0 }; out.set(name, o); }
+              o.x += d.x * w; o.y += d.y * w; o.z += d.z * w;
+            }
+          };
+          addLayer(breath, wBreath);
+          addLayer(speech, wSpeech);
+          addLayer(gestureMap, gestureW);
+          addLayer(sleep, wSleep);
+          addLayer(look, wLook);
+          addLayer(emotionBody, 1);
+          return out;
+        }
+
+        function playGesture(name) {
+          if (!GESTURES[name]) return false;
+          gesture = { name, t0: performance.now() };
+          wake();
+          return true;
+        }
+
+        // --- Phoneme → viseme mapping (Russian letters → mouth morphs) ---
+        const VISEME_VOWEL = {
+          'а': 'aa', 'я': 'aa',
+          'е': 'ee', 'э': 'ee',
+          'и': 'ih', 'ы': 'ih', 'й': 'ih',
+          'о': 'oh', 'ё': 'oh',
+          'у': 'ou', 'ю': 'ou',
+        };
+        const VISEME_CONSONANT = { 'м': 'closed', 'п': 'closed', 'б': 'closed', 'в': 'fv', 'ф': 'fv' };
+        // Target morph weights per viseme (Captain's 5 mouth morphs: aa/ih/oh/ou/ee).
+        const VISEME_WEIGHTS = {
+          aa: { aa: 0.9, ih: 0, oh: 0, ou: 0, ee: 0 },
+          ee: { aa: 0, ih: 0, oh: 0, ou: 0, ee: 0.85 },
+          ih: { aa: 0, ih: 0.8, oh: 0, ou: 0, ee: 0 },
+          oh: { aa: 0, ih: 0, oh: 0.9, ou: 0, ee: 0 },
+          ou: { aa: 0, ih: 0, oh: 0, ou: 0.9, ee: 0 },
+          closed: { aa: 0, ih: 0, oh: 0, ou: 0, ee: 0 },
+          neutral: { aa: 0, ih: 0.22, oh: 0, ou: 0, ee: 0 },
+          fv: { aa: 0, ih: 0.32, oh: 0, ou: 0, ee: 0 },
+        };
+        function computeVisemes(text) {
+          const seq = [];
+          const dur = 0.065; // ~65ms per char ≈ conversational speech rate
+          for (const ch of String(text || '').toLowerCase()) {
+            if (VISEME_VOWEL[ch]) seq.push({ v: VISEME_VOWEL[ch], dur });
+            else if (VISEME_CONSONANT[ch]) seq.push({ v: VISEME_CONSONANT[ch], dur });
+            else if (ch === ' ' || ch === '.' || ch === ',' || ch === '!' || ch === '?' || ch === '…') seq.push({ v: 'closed', dur: 0.11 });
+            else seq.push({ v: 'neutral', dur });
+          }
+          return seq;
+        }
+        function sampleViseme(seq, t) {
+          if (!seq.length) return 'closed';
+          let acc = 0;
+          for (const s of seq) {
+            if (t < acc + s.dur) return s.v;
+            acc += s.dur;
+          }
+          return 'closed'; // past the end → mouth closes
+        }
+
+        function setTalking(on, text) {
+          const wasSpeaking = speaking;
+          speaking = !!on;
+          if (speaking) {
+            wake();   // agent starts speaking → wake the character
+            if (typeof text === 'string' && text !== speechText) {
+              speechText = text;
+              visemeSeq = computeVisemes(text);
+            }
+            if (!wasSpeaking) visemeClock = 0; // new utterance → restart the clock
+          } else {
+            speechText = ''; visemeSeq = []; visemeClock = 0;
+            lastActivity = performance.now();  // speech ended → start the idle countdown
+          }
+        }
+        function setBreathing(on) { breathing = on !== false; }
+        function setSleeping(on) {
+          if (on) { sleeping = true; }
+          else { wake(); }   // manual wake = smooth transition via wSleep easing
+        }
+        // Wake the character from sleep (the blend tree eases wSleep → 0) and mark interaction.
+        function wake() { sleeping = false; lastActivity = performance.now(); }
+
+        let lastT = performance.now();
+        renderer.setAnimationLoop(() => {
+          const now = performance.now();
+          const dt = Math.min((now - lastT) / 1000, 0.1); lastT = now;
+          breathT += dt * (speaking ? 1.7 : 0.6);
+          if (model && autoRotate) model.rotation.y += dt * 0.25;
+
+          // Auto-sleep lifecycle: drift back to sleep after idle (no speech/gesture/manual pose).
+          if (!sleeping && !speaking && !gesture && (now - lastActivity) > IDLE_SLEEP_TIMEOUT * 1000) {
+            sleeping = true;
+          }
+
+          // Smooth layer weights toward their targets (exponential easing — no hard cuts).
+          const tBreath = (breathing && !speaking && !sleeping) ? 1 : 0;
+          const tSpeech = (speaking && !sleeping) ? 1 : 0;
+          const tSleep = sleeping ? 1 : 0;
+          const tLook = (!sleeping && (lookX || lookY)) ? 1 : 0;
+          const ease = (tau) => 1 - Math.exp(-dt / tau);
+          wBreath += (tBreath - wBreath) * ease(0.35);
+          wSpeech += (tSpeech - wSpeech) * ease(0.18);
+          wSleep += (tSleep - wSleep) * ease(0.45);
+          wLook += (tLook - wLook) * ease(0.25);
+
+          if (bones.size) applyPose(computeAnim(now));
+
+          // Blink: random every 2-5.5s, ~0.24s close-open.
+          if (blinkT < 0) {
+            if (now >= blinkNext) blinkT = 0;
+          } else {
+            blinkT += dt;
+            if (blinkT > 0.24) { blinkT = -1; blinkNext = now + 2000 + Math.random() * 3500; }
+          }
+          let blinkW = blinkT < 0 ? 0 : (blinkT < 0.12 ? blinkT / 0.12 : Math.max(0, 1 - (blinkT - 0.12) / 0.12));
+          if (sleeping) blinkW = 1.0;   // eyes fully closed while sleeping
+          if ((emotionWeights['surprised'] || 0) > 0.25) blinkW = 0;   // wide-eyed stare when surprised
+
+          // Mouth: phoneme/viseme lip-sync — sample the viseme sequence from the spoken text.
+          let mouthA = 0, mouthI = 0, mouthO = 0, mouthU = 0, mouthE = 0;
+          if (speaking && !sleeping && visemeSeq.length) {
+            visemeClock += dt;
+            const t = VISEME_WEIGHTS[sampleViseme(visemeSeq, visemeClock)] || VISEME_WEIGHTS.closed;
+            const k = 1 - Math.exp(-dt * 22); // fast response for crisp lip-sync
+            mouthA += (t.aa - mouthA) * k;
+            mouthI += (t.ih - mouthI) * k;
+            mouthO += (t.oh - mouthO) * k;
+            mouthU += (t.ou - mouthU) * k;
+            mouthE += (t.ee - mouthE) * k;
+          } else {
+            // decay toward closed when not speaking
+            const k = Math.max(0, 1 - dt * 14);
+            mouthA *= k; mouthI *= k; mouthO *= k; mouthU *= k; mouthE *= k;
+          }
+
+          // Emotion mouth (continuous, weighted): happy/relaxed laugh, surprised agape, sad pout.
+          if (!speaking && !sleeping) {
+            const wHapM = (emotionWeights['happy'] || 0) + (emotionWeights['relaxed'] || 0) * 0.4;
+            const wSurM = emotionWeights['surprised'] || 0;
+            const wSadM = emotionWeights['sad'] || 0;
+            if (wHapM > 0.05) {
+              const t = (now / 1000) * 2 * Math.PI * 2.2;
+              const open = Math.pow(Math.max(0, Math.sin(t)), 2);
+              mouthA += open * 0.65 * wHapM;
+              mouthO += open * 0.3 * wHapM;
+            }
+            if (wSurM > 0.05) { mouthA += 0.45 * wSurM; mouthO += 0.25 * wSurM; }
+            if (wSadM > 0.05) { mouthO += 0.2 * wSadM; }
+          }
+
+          // Emotion vector: each expression morph lerps toward its own target weight (0 when sleeping).
+          for (const name of Object.keys(expressions)) {
+            const target = sleeping ? 0 : (emotionTargets[name] || 0);
+            const cur = emotionWeights[name] || 0;
+            const rate = target > cur ? 8 : 3; // fast onset, slow relaxation — more human
+            const next = cur + (target - cur) * (1 - Math.exp(-dt * rate));
+            emotionWeights[name] = (next < 0.0005 && target === 0) ? 0 : next;
+          }
+
+          if (allMorphSlots.length) {
+            for (const s of allMorphSlots) s.mesh.morphTargetInfluences[s.morphIndex] = 0;
+            if (blinkW > 0.001) addMorph('blink', blinkW);
+            if (mouthA > 0.001) addMorph('aa', mouthA);
+            if (mouthI > 0.001) addMorph('ih', mouthI);
+            if (mouthO > 0.001) addMorph('oh', mouthO);
+            if (mouthU > 0.001) addMorph('ou', mouthU);
+            if (mouthE > 0.001) addMorph('ee', mouthE);
+            for (const name of Object.keys(emotionWeights)) {
+              const w = emotionWeights[name];
+              if (w > 0.001) addMorph(name, w);
+            }
+          }
+
+          renderer.render(scene, camera);
+        });
+
+        // expose to preload bridge
+        window.__amadeus3d = {
+          loadModel,
+          setBone,
+          resetPose,
+          listBones,
+          setScale,
+          setAutoRotate,
+          playGesture,
+          setTalking,
+          setBreathing,
+          setSleeping,
+          setExpression,
+          setEmotion,
+          listExpressions,
+          get boneCount() { return bones.size; }
+        };
+        window.dispatchEvent(new CustomEvent('amadeus3d:ready'));
+
+        // Command bridge to main.js (reuses the shared Live2D preload's window.amadeus).
+        const bridge = window.amadeus;
+        if (bridge && typeof bridge.onCommand === 'function') {
+          bridge.onCommand(async (id, command) => {
+            const name = command && command.name;
+            const args = (command && command.args) || {};
+            let result;
+            try {
+              if (name === 'load_model') {
+                result = await loadModel(String(args.url || ''));
+              } else if (name === 'list_bones') {
+                result = { ok: true, bones: listBones() };
+              } else if (name === 'set_bone') {
+                const ok = setBone(String(args.bone || ''), Number(args.x) || 0, Number(args.y) || 0, Number(args.z) || 0);
+                result = ok ? { ok: true } : { ok: false, error: 'bone not found: ' + args.bone };
+              } else if (name === 'reset_pose') {
+                resetPose();
+                result = { ok: true };
+              } else if (name === 'set_scale') {
+                setScale(Number(args.scale) || 1);
+                result = { ok: true };
+              } else if (name === 'set_auto_rotate') {
+                setAutoRotate(args.on !== false);
+                result = { ok: true };
+              } else if (name === 'gesture') {
+                const g = String(args.gesture || args.name || '');
+                result = playGesture(g) ? { ok: true, gesture: g } : { ok: false, error: 'unknown gesture: ' + g + ' (wave/nod/shake/point/bow/stretch/clap/thumbs_up/salute/dance/shrug/look_around)' };
+              } else if (name === 'talk') {
+                setTalking(args.on !== false, typeof args.text === 'string' ? args.text : '');
+                result = { ok: true, talking: speaking };
+              } else if (name === 'set_breathing') {
+                setBreathing(args.on !== false);
+                result = { ok: true, breathing };
+              } else if (name === 'sleep' || name === 'set_sleeping') {
+                setSleeping(args.on !== false);
+                result = { ok: true, sleeping };
+              } else if (name === 'set_expression') {
+                const expr = String(args.name || args.expression || '');
+                result = setExpression(expr) ? { ok: true, expression: expr } : { ok: false, error: 'unknown expression: ' + expr + ' (' + listExpressions().join('/') + ')' };
+              } else if (name === 'set_emotion') {
+                const vec = (args.emotions && typeof args.emotions === 'object') ? args.emotions : (args.vector || args);
+                setEmotion(vec);
+                result = { ok: true, emotions: emotionTargets };
+              } else if (name === 'list_expressions') {
+                result = { ok: true, expressions: listExpressions() };
+              } else {
+                result = { ok: false, error: 'unknown command: ' + name };
+              }
+            } catch (e) {
+              result = { ok: false, error: String((e && e.message) || e) };
+            }
+            bridge.answer(id, result);
+          });
+        }
+        console.log('[3d] ready');
+      } catch (e) {
+        console.error('[3d] init failed:', (e && e.stack) ? e.stack : String(e));
+        const errEl = document.getElementById('err');
+        errEl.textContent = 'Ошибка инициализации: ' + ((e && e.message) ? e.message : String(e));
+        errEl.style.display = 'block';
+      }
+    })();
+  </script>
+</body>
+</html>

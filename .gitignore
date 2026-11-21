@@ -1,0 +1,15 @@
+# Third-party Live2D / 3D models (large, separate licenses) — put them into companion/models locally
+amadeus-live2d/companion/models/
+amadeus-live3d/companion/models/
+
+# Per-user companion settings
+**/companion/settings.json
+
+# Local backups and debug artifacts
+**/_backup/
+*.orig-bak
+*.bak-bubble
+_live_dsh.png
+
+node_modules/
+*.log

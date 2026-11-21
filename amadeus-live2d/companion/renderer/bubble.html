@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" />
+    <title>Amadeus — ответ</title>
+    <script type="module" crossorigin src="./assets/bubble-Jo_9-O7G.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/bubble-B18_E_sI.css">
+  </head>
+  <body>
+    <div id="bubble" class="bubble" hidden>
+      <svg class="frame" id="frame" aria-hidden="true">
+        <defs>
+          <linearGradient id="fill" x1="0" y1="0" x2="1" y2="1">
+            <stop id="fill-top" offset="0" />
+            <stop id="fill-base" offset="1" />
+          </linearGradient>
+        </defs>
+        <path id="shadow" />
+        <path id="shape" fill="url(#fill)" />
+      </svg>
+      <div class="content" id="content">
+        <div class="header">
+          <canvas id="orb" class="orb" width="160" height="160"></canvas>
+          <div class="heading">
+            <div class="caption">AMADEUS</div>
+            <div id="status" class="status"></div>
+          </div>
+        </div>
+        <div id="progress" class="progress"><span></span></div>
+        <div id="activity" class="activity"></div>
+        <div id="text" class="text"></div>
+        <div id="hint" class="hint"></div>
+      </div>
+      <div id="measure" class="measure" aria-hidden="true"></div>
+    </div>
+  </body>
+</html>

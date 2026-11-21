@@ -1,0 +1,7 @@
+{
+  "name": "amadeus-live3d-companion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Electron sidecar hosting the 3D VRM/glTF character window (driven by the DSH plugin over stdin/stdout JSON lines).",
+  "main": "main.js"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "amadeus-live2d-companion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Electron sidecar hosting the Live2D character window (driven by the DSH plugin over HTTP).",
+  "main": "main.js"
+}

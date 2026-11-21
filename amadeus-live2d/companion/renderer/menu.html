@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" />
+    <title>Amadeus — меню</title>
+    <style>
+      :root {
+        --bg: rgba(30, 28, 38, 0.92);
+        --fg: #f2f0f7;
+        --accent: #7a6cf0;
+        --accent-soft: rgba(122, 108, 240, 0.18);
+        --danger: #f06a6a;
+        --line: rgba(255, 255, 255, 0.10);
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { background: transparent; overflow: hidden; }
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        color: var(--fg);
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      .menu {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        padding: 8px;
+      }
+      .btn {
+        position: relative;
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--fg);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        backdrop-filter: blur(6px);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+      }
+      .btn:hover { transform: scale(1.07); border-color: var(--accent); }
+      .btn:active { transform: scale(0.96); }
+      .btn svg { width: 26px; height: 26px; pointer-events: none; }
+      .icon-stroke {
+        fill: none;
+        stroke: var(--fg);
+        stroke-width: 1.9;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .icon-fill {
+        fill: var(--fg);
+        stroke: none;
+      }
+      /* microphone recording state */
+      .btn.recording {
+        border-color: var(--danger);
+        background: rgba(240, 106, 106, 0.16);
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      .btn.recording:hover { border-color: var(--danger); }
+      .btn.recording .icon-stroke { stroke: #ffd6d6; }
+      .btn.recording .icon-fill { fill: #ffd6d6; }
+      @keyframes pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(240, 106, 106, 0.45), 0 6px 20px rgba(0,0,0,0.35); }
+        50% { box-shadow: 0 0 0 9px rgba(240, 106, 106, 0), 0 6px 20px rgba(0,0,0,0.35); }
+      }
+      /* sound waves: appear and ripple with loudness while recording */
+      .mic-waves {
+        opacity: 0;
+        transform-origin: 12px 10px;
+        transition: opacity 0.12s ease;
+      }
+      .mic-waves path {
+        fill: none;
+        stroke: var(--danger);
+        stroke-width: 1.7;
+        stroke-linecap: round;
+      }
+      /* composer */
+      .composer {
+        display: none;
+        flex-direction: column;
+        gap: 6px;
+        width: 224px;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 8px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(6px);
+      }
+      .composer.open { display: flex; }
+      .composer textarea {
+        width: 100%;
+        height: 64px;
+        resize: none;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--fg);
+        font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+        padding: 6px 8px;
+        outline: none;
+        -webkit-user-select: text;
+        user-select: text;
+      }
+      .composer textarea:focus { border-color: var(--accent); }
+      .composer .row { display: flex; align-items: center; gap: 6px; }
+      .composer .hint { flex: 1; font-size: 10px; opacity: 0.55; }
+      .composer .send {
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: #fff;
+        border-radius: 999px;
+        padding: 5px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .composer .send:hover { background: #8b7cf5; }
+      .composer .send:disabled { opacity: 0.5; cursor: default; }
+      .status {
+        max-width: 220px;
+        font-size: 11px;
+        line-height: 1.35;
+        text-align: center;
+        color: #ffd6d6;
+        text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+        white-space: pre-wrap;
+      }
+      .status:empty { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="menu" id="menu">
+      <button class="btn" id="mic" title="Включить микрофон" aria-label="Включить микрофон">
+        <svg viewBox="-1 0 26 24" aria-hidden="true">
+          <g class="mic-glyph">
+            <path class="icon-stroke" d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path class="icon-stroke" d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <path class="icon-stroke" d="M12 19v4"/>
+            <path class="icon-stroke" d="M8 23h8"/>
+          </g>
+          <g class="mic-waves" id="mic-waves">
+            <path d="M21 4a5 5 0 0 1 0 12"/>
+            <path d="M23.5 1.5a9 9 0 0 1 0 17"/>
+          </g>
+        </svg>
+      </button>
+      <button class="btn" id="send" title="Отправить сообщение" aria-label="Отправить сообщение">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path class="icon-stroke" d="M22 2 11 13"/>
+          <path class="icon-stroke" d="M22 2 15 22l-4-9-9-4z"/>
+        </svg>
+      </button>
+      <p class="status" id="status" role="status"></p>
+    </div>
+
+    <section class="composer" id="composer">
+      <textarea id="text" rows="3" placeholder="Сообщение персонажу…"></textarea>
+      <div class="row">
+        <span class="hint">Enter — отправить</span>
+        <button class="send" id="send-now" type="button">Отправить</button>
+      </div>
+    </section>
+
+    <script>
+      (() => {
+        const api = window.amadeus;
+        const mic = document.getElementById("mic");
+        const send = document.getElementById("send");
+        const sendNow = document.getElementById("send-now");
+        const text = document.getElementById("text");
+        const composer = document.getElementById("composer");
+        const status = document.getElementById("status");
+        const waves = document.getElementById("mic-waves");
+        let recording = false;
+
+        function paint(level) {
+          const l = Math.min(1, Math.max(0, level));
+          waves.style.opacity = l > 0.02 ? String(0.25 + l * 0.75) : "0";
+          waves.style.transform = `scale(${0.9 + l * 0.25})`;
+        }
+
+        function setRecording(on) {
+          recording = on;
+          mic.classList.toggle("recording", on);
+          mic.title = on ? "Остановить и отправить запись" : "Включить микрофон";
+          mic.setAttribute("aria-label", mic.title);
+          status.textContent = on ? "Слушаю…\nнажми ещё раз, чтобы отправить" : "";
+          if (!on) paint(0);
+        }
+
+        mic.addEventListener("click", () => {
+          api.menuAction("microphone");
+          setRecording(!recording);
+        });
+
+        send.addEventListener("click", () => {
+          composer.classList.toggle("open");
+          if (composer.classList.contains("open")) text.focus();
+        });
+
+        async function submit() {
+          const value = text.value.trim();
+          if (!value || sendNow.disabled) return;
+          sendNow.disabled = true;
+          status.textContent = "";
+          const result = await api.menuSend(value);
+          sendNow.disabled = false;
+          if (result && result.ok) {
+            text.value = "";
+            composer.classList.remove("open");
+            status.textContent = "Отправлено";
+            setTimeout(() => api.menuAction("close"), 700);
+          } else {
+            status.textContent = (result && result.error) || "Не удалось отправить.";
+          }
+        }
+        sendNow.addEventListener("click", submit);
+        text.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+            e.preventDefault();
+            submit();
+          }
+        });
+
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") api.menuAction("close");
+        });
+
+        api.onMenuLevel((level) => {
+          if (!recording) return;
+          paint(Math.min(1, Math.sqrt(Math.max(0, level)) * 2.5));
+        });
+
+        api.onMenuOpen((state) => {
+          composer.classList.remove("open");
+          text.value = "";
+          status.textContent = "";
+          setRecording(Boolean(state && state.recording));
+        });
+
+        api.onMenuRecording((on) => setRecording(Boolean(on)));
+
+        window.addEventListener("blur", () => {
+          if (composer.classList.contains("open")) composer.classList.remove("open");
+        });
+      })();
+    </script>
+  </body>
+</html>
