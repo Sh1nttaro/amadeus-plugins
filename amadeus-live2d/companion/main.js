@@ -11,13 +11,14 @@
 //   POST /shutdown                      -> { ok:true }
 'use strict';
 
-const { app, BrowserWindow, ipcMain, protocol, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, screen, dialog } = require('electron');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
+const importer = require('./importer');
 
 const RENDERER_DIR = path.join(__dirname, 'renderer');
 const MODELS_DIR = path.join(__dirname, 'models');
@@ -406,10 +407,67 @@ function listModelsFull() {
   return listModels().map(fullModel);
 }
 
+function hasPreview(id) {
+  const dir = path.join(MODELS_DIR, id);
+  try { return fs.readdirSync(dir).some((f) => /^(preview|icon|thumbnail|portrait|avatar)\.(png|jpe?g|webp)$/i.test(f) || /^ico_.*\.(png|jpe?g)$/i.test(f)); } catch { return false; }
+}
+
+let importing = Promise.resolve();
+/** Import archives/folders, then render card previews for models that ship none. One import at a time. */
+function runImport(paths) {
+  const job = importing.then(async () => {
+    const results = await importer.importPaths(paths, MODELS_DIR);
+    const ids = results.flatMap((r) => r.imported.map((m) => m.id));
+    if (ids.length && character && !character.webContents.isDestroyed()) character.webContents.send('link:settings', settings());
+    if (ids.length && (await waitReady(20000))) {
+      for (const r of results) {
+        for (const m of r.imported) {
+          if (hasPreview(m.id)) { m.preview = true; continue; }
+          const res = await commandResult({ name: 'render_preview', modelId: m.id }, 20000).catch(() => null);
+          m.preview = Boolean(res && res.ok);
+        }
+      }
+    }
+    return { ok: true, results };
+  });
+  importing = job.catch(() => {});
+  return job;
+}
+
+/** Rename a model or the label of one of its expressions / motions (catalog.json + character.json). */
+function renameLabels(body) {
+  const id = body.id;
+  if (typeof id !== 'string' || !MODEL_ID.test(id)) throw new Error('Некорректный id модели.');
+  const dir = path.join(MODELS_DIR, id);
+  const label = String(body.label || '').trim().slice(0, 60);
+  if (!label) throw new Error('Пустое название.');
+  if (body.kind === 'model') {
+    const file = path.join(dir, 'character.json');
+    const c = JSON.parse(fs.readFileSync(file, 'utf8'));
+    c.displayName = label;
+    fs.writeFileSync(file, JSON.stringify(c, null, 2));
+    return { ok: true };
+  }
+  const file = path.join(dir, 'catalog.json');
+  const cat = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (body.kind === 'expression') {
+    const e = (cat.expressions || []).find((x) => x.key === body.key);
+    if (!e) throw new Error('Эмоция не найдена.');
+    e.label = label;
+  } else if (body.kind === 'motion') {
+    const g = (cat.motions || []).find((x) => x.key === body.group);
+    const item = g && g.items && g.items[Number(body.index)];
+    if (!item) throw new Error('Движение не найдено.');
+    item.label = label;
+  } else throw new Error('Неизвестный тип.');
+  fs.writeFileSync(file, JSON.stringify(cat, null, 2));
+  return { ok: true };
+}
+
 function sendCommand(command) {
   if (!character || character.webContents.isLoading()) { dlog('sendCommand: null (isLoading=' + Boolean(character && character.webContents.isLoading()) + ')'); return null; }
   const id = randomUUID();
-  character.webContents.send('link:command', id, { ...command, modelId: activeModelId });
+  character.webContents.send('link:command', id, { modelId: activeModelId, ...command });
   return id;
 }
 
@@ -660,8 +718,16 @@ function registerIpc() {
   ipcMain.handle('desktop:perch', () => ({ ok: false, error: 'Недоступно.' }));
   ipcMain.handle('menu:upload', () => ({ ok: false, error: 'Недоступно.' }));
   ipcMain.handle('menu:pick', () => ({ ok: false, error: 'Недоступно.' }));
-  ipcMain.handle('preview:exists', () => false);
-  ipcMain.handle('preview:upload', () => ({ ok: true }));
+  // Card previews rendered by the character window (render_preview / ensurePreview).
+  ipcMain.handle('preview:exists', (_e, id) => typeof id === 'string' && MODEL_ID.test(id) && hasPreview(id));
+  ipcMain.handle('preview:upload', (_e, id, png) => {
+    if (typeof id !== 'string' || !MODEL_ID.test(id)) return { ok: false, error: 'Некорректный id модели.' };
+    const dir = path.join(MODELS_DIR, id);
+    const buffer = Buffer.isBuffer(png) ? png : png instanceof ArrayBuffer ? Buffer.from(png) : ArrayBuffer.isView(png) ? Buffer.from(png.buffer, png.byteOffset, png.byteLength) : null;
+    if (!buffer || !buffer.length || !fs.existsSync(dir)) return { ok: false, error: 'Нет данных превью.' };
+    fs.writeFileSync(path.join(dir, 'preview.png'), buffer);
+    return { ok: true };
+  });
 }
 
 // ---- HTTP control server ----
@@ -767,6 +833,28 @@ const server = http.createServer((req, res) => {
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
     } else if (req.method === 'POST' && route === '/transcribe') {
       try { json(200, await transcribe(body.data, body.type, body.filename)); }
+      catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
+    } else if (req.method === 'POST' && route === '/import') {
+      const paths = Array.isArray(body.paths) ? body.paths.filter((p) => typeof p === 'string' && p) : [];
+      if (!paths.length) json(200, { ok: false, error: 'Нечего импортировать.' });
+      else json(200, await runImport(paths));
+    } else if (req.method === 'POST' && route === '/import_dialog') {
+      const folder = body.kind === 'folder';
+      const picked = await dialog.showOpenDialog({
+        title: folder ? 'Папка с моделью Live2D' : 'Архив с моделью Live2D',
+        defaultPath: app.getPath('downloads'),
+        properties: folder ? ['openDirectory', 'multiSelections'] : ['openFile', 'multiSelections'],
+        filters: folder ? [] : [{ name: 'Архивы с моделями', extensions: ['zip', 'rar', '7z'] }],
+      });
+      if (picked.canceled || !picked.filePaths.length) json(200, { ok: true, canceled: true, results: [] });
+      else json(200, await runImport(picked.filePaths));
+    } else if (req.method === 'POST' && route === '/relabel') {
+      try {
+        if (typeof body.id !== 'string' || !MODEL_ID.test(body.id)) throw new Error('Некорректный id модели.');
+        json(200, { ok: true, ...importer.relabel(path.join(MODELS_DIR, body.id)) });
+      } catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
+    } else if (req.method === 'POST' && route === '/rename') {
+      try { json(200, renameLabels(body)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
     } else if (req.method === 'GET' && route === '/ping') {
       json(200, { ok: true, pong: true });

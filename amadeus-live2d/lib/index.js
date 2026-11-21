@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { readdirSync, existsSync, readFileSync, createReadStream } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, createReadStream, createWriteStream, mkdtempSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, basename, extname, sep } from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -240,9 +241,9 @@ function fullModelHost(id) {
     const motions = (cat.motions || []).map((g) => ({
       key: g.key,
       label: g.label || g.key,
-      items: (g.items || []).map((it, i) => ({ index: i, label: it.label })),
+      items: (g.items || []).map((it, i) => ({ index: i, label: it.label, original: it.original || '' })),
     }));
-    const expressions = (cat.expressions || []).map((e) => ({ name: e.key, label: e.label || e.key }));
+    const expressions = (cat.expressions || []).map((e) => ({ name: e.key, label: e.label || e.key, original: e.original || '' }));
     return {
       id,
       name: char.displayName || id,
@@ -263,6 +264,70 @@ function listModelsHost() {
     return readdirSync(MODELS_DIR, { withFileTypes: true })
       .filter((e) => e.isDirectory() && existsSync(join(MODELS_DIR, e.name, 'character.json')))
       .map((e) => fullModelHost(e.name));
+  } catch {
+    return [];
+  }
+}
+
+const UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024;
+const DOWNLOADS_DIR = join(homedir(), 'Downloads');
+
+const peekCache = new Map();
+/** What a zip holds, from its central directory only: 'live2d' | 'cubism2' | 'none' | 'unknown' (rar/7z). */
+function peekArchive(file) {
+  if (!/\.zip$/i.test(file)) return 'unknown';
+  let st;
+  try { st = statSync(file); } catch { return 'unknown'; }
+  const key = file + ':' + st.size + ':' + st.mtimeMs;
+  if (peekCache.has(key)) return peekCache.get(key);
+  let kind = 'unknown';
+  let fd = -1;
+  try {
+    fd = openSync(file, 'r');
+    const tail = Math.min(st.size, 65557);
+    const buf = Buffer.alloc(tail);
+    readSync(fd, buf, 0, tail, st.size - tail);
+    let eocd = -1;
+    for (let i = tail - 22; i >= 0; i--) if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    if (eocd >= 0) {
+      const cdSize = buf.readUInt32LE(eocd + 12);
+      const cdOffset = buf.readUInt32LE(eocd + 16);
+      if (cdSize > 0 && cdSize < 64 * 1024 * 1024 && cdOffset !== 0xffffffff) {
+        const cd = Buffer.alloc(cdSize);
+        readSync(fd, cd, 0, cdSize, cdOffset);
+        const names = cd.toString('latin1').toLowerCase();
+        kind = names.includes('.model3.json') || names.includes('.moc3') ? 'live2d'
+          : /\.moc(?![a-z0-9])|model\.json/.test(names) ? 'cubism2'
+          : /\.(zip|rar|7z)(?![a-z0-9])/.test(names) ? 'unknown' : 'none';
+      }
+    }
+  } catch { kind = 'unknown'; }
+  finally { if (fd >= 0) try { closeSync(fd); } catch {} }
+  peekCache.set(key, kind);
+  return kind;
+}
+
+/** Archives downloaded in the last 60 days, newest first; "imported" when a model came from it. */
+function recentArchives() {
+  const importedFrom = new Set();
+  try {
+    for (const e of readdirSync(MODELS_DIR, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      try {
+        const c = JSON.parse(readFileSync(join(MODELS_DIR, e.name, 'character.json'), 'utf8'));
+        if (c.source && c.source.archive) importedFrom.add(String(c.source.archive).toLowerCase());
+      } catch {}
+    }
+  } catch {}
+  const since = Date.now() - 60 * 24 * 3600 * 1000;
+  try {
+    return readdirSync(DOWNLOADS_DIR, { withFileTypes: true })
+      .filter((e) => e.isFile() && /\.(zip|rar|7z)$/i.test(e.name))
+      .map((e) => { const st = statSync(join(DOWNLOADS_DIR, e.name)); return { name: e.name, size: st.size, mtime: st.mtimeMs }; })
+      .filter((f) => f.mtime >= since)
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 30)
+      .map((f) => ({ ...f, imported: importedFrom.has(f.name.toLowerCase()), kind: peekArchive(join(DOWNLOADS_DIR, f.name)) }));
   } catch {
     return [];
   }
@@ -488,6 +553,95 @@ function apply(ctx) {
       handler: async (req, res) => {
         if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return; }
         try { const r = await http('/chat-message'); sendJson(res, 200, r); }
+        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
+      },
+    });
+
+    // ---- Import: native dialog, drag-and-drop upload, recent archives in Downloads ----
+    const IMPORT_TIMEOUT = 10 * 60 * 1000;
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/import-dialog',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const body = await readJson(req);
+        try { sendJson(res, 200, await http('/import_dialog', { kind: body.kind === 'folder' ? 'folder' : 'archive' }, IMPORT_TIMEOUT)); }
+        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/import-upload',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const name = basename(String(new URL(req.url, 'http://x').searchParams.get('name') || ''));
+        if (!/\.(zip|rar|7z)$/i.test(name)) { sendJson(res, 200, { ok: false, error: 'Перетащите архив .zip, .rar или .7z (папку — через кнопку «Папка…»).' }); req.resume(); return; }
+        const dir = mkdtempSync(join(tmpdir(), 'amadeus-upload-'));
+        const file = join(dir, name);
+        try {
+          await new Promise((resolve, reject) => {
+            let size = 0;
+            const out = createWriteStream(file);
+            req.on('data', (chunk) => {
+              size += chunk.length;
+              if (size > UPLOAD_LIMIT) { req.destroy(); out.destroy(); reject(new Error('Архив больше 2 ГБ.')); }
+            });
+            req.pipe(out);
+            out.on('finish', resolve);
+            out.on('error', reject);
+            req.on('error', reject);
+          });
+          sendJson(res, 200, await http('/import', { paths: [file] }, IMPORT_TIMEOUT));
+        } catch (e) {
+          sendJson(res, 200, { ok: false, error: e.message });
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/downloads',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return; }
+        sendJson(res, 200, { dir: DOWNLOADS_DIR, files: recentArchives() });
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/import-downloads',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const body = await readJson(req);
+        const name = basename(String(body.name || ''));
+        const file = join(DOWNLOADS_DIR, name);
+        if (!/\.(zip|rar|7z)$/i.test(name) || !existsSync(file)) { sendJson(res, 200, { ok: false, error: 'Файл не найден в папке «Загрузки».' }); return; }
+        try { sendJson(res, 200, await http('/import', { paths: [file] }, IMPORT_TIMEOUT)); }
+        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/relabel',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const body = await readJson(req);
+        try { sendJson(res, 200, await http('/relabel', { id: body.id })); }
+        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/rename',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const body = await readJson(req);
+        try { sendJson(res, 200, await http('/rename', body)); }
         catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
       },
     });
