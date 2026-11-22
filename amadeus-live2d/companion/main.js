@@ -831,6 +831,10 @@ const server = http.createServer((req, res) => {
     } else if (req.method === 'POST' && route === '/voice-import') {
       try { json(200, await importVoice(body)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
+    } else if (req.method === 'POST' && route === '/provider') {
+      if (typeof body.key === 'string' && body.key) process.env.LITELLM_API_KEY = body.key;
+      if (typeof body.baseUrl === 'string' && /^https?:\/\//.test(body.baseUrl)) process.env.LITELLM_BASE_URL = body.baseUrl;
+      json(200, { ok: true });
     } else if (req.method === 'POST' && route === '/transcribe') {
       try { json(200, await transcribe(body.data, body.type, body.filename)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }

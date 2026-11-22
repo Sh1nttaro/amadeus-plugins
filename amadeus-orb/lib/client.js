@@ -236,7 +236,7 @@ window.__ModuleLoader__.load({
 		var syncTimer = 0;
 		function saveLook(look) {
 			try { window.localStorage.setItem(LOOK_KEY, JSON.stringify(look)); } catch (e) {}
-			// The live2D bubble draws the same orb + dots: send it colors/mode/shape too.
+			// The live2D / live3D bubbles draw the same orb + dots: send them colors/mode/shape too.
 			clearTimeout(syncTimer);
 			syncTimer = setTimeout(function () {
 				var out = {};
@@ -247,7 +247,9 @@ window.__ModuleLoader__.load({
 					if (v.shape) e.shape = v.shape;
 					if (Object.keys(e).length) out[k] = e;
 				});
-				fetch("/amadeus-live2d/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ speechBubble: { orb: out } }) }).catch(function () {});
+				["/amadeus-live2d/settings", "/amadeus-live3d/settings"].forEach(function (url) {
+					fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ speechBubble: { orb: out } }) }).catch(function () {});
+				});
 			}, 300);
 		}
 		function lookColors(look) {
