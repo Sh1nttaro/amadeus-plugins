@@ -497,8 +497,20 @@ function CharacterSettingsBar(props) {
   if (part === "voice") {
     return auiCard("voice-replies", "Озвучка ответов", "Персонаж читает готовый ответ агента вслух.", [
       auiRow("enabled", "Озвучивать ответы", null, auiSwitch(!!vr.enabled, busy, function () { applyPatch({ voiceReplies: { enabled: !vr.enabled } }); })),
-      auiRow("voice", "Голос", null, jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.voice || "sveta", onChange: function (e) { applyPatch({ voiceReplies: { voice: e.target.value } }); }, children: voices.map(function (v) { return jsx("option", { key: v, value: v, children: v }); }) }), !vr.enabled),
-      auiRow("speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (s) {
+      auiRow("engine", "Движок", null, jsx("div", { className: "aui-seg", children: [["edge", "Edge (онлайн)"], ["kokoro", "Kokoro (локально)"]].map(function (m) {
+        return jsx("button", { key: m[0], type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + ((vr.engine || "edge") === m[0] ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { engine: m[0] } }); }, children: m[1] });
+      }) }), !vr.enabled),
+      (vr.engine || "edge") === "edge" ? auiRow("evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft. Без интернета — Kokoro.", jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.edgeVoice || "ru-RU-SvetlanaNeural", onChange: function (e) { applyPatch({ voiceReplies: { edgeVoice: e.target.value } }); }, children: [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]].map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !vr.enabled) : null,
+      (vr.engine || "edge") === "edge" ? auiRow("erate", "Темп", null, jsx("div", { className: "aui-seg", children: [-10, 0, 10, 20].map(function (x) {
+        var cur = vr.edgeRate == null ? 10 : vr.edgeRate;
+        return jsx("button", { key: x, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (cur === x ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { edgeRate: x } }); }, children: (x > 0 ? "+" : "") + x + "%" });
+      }) }), !vr.enabled) : null,
+      (vr.engine || "edge") === "edge" ? auiRow("epitch", "Высота голоса", null, jsx("div", { className: "aui-seg", children: [0, 8, 15, 25].map(function (x) {
+        var cur = vr.edgePitch == null ? 15 : vr.edgePitch;
+        return jsx("button", { key: x, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (cur === x ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { edgePitch: x } }); }, children: x === 0 ? "обычная" : "+" + x });
+      }) }), !vr.enabled) : null,
+      (vr.engine || "edge") === "edge" ? null : auiRow("voice", "Голос", null, jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.voice || "sveta", onChange: function (e) { applyPatch({ voiceReplies: { voice: e.target.value } }); }, children: voices.map(function (v) { return jsx("option", { key: v, value: v, children: v }); }) }), !vr.enabled),
+      (vr.engine || "edge") === "edge" ? null : auiRow("speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (s) {
         var active = String(vr.speed != null ? vr.speed : 1) === s;
         return jsx("button", { key: s, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (active ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { speed: Number(s) } }); }, children: s + "×" });
       }) }), !vr.enabled)

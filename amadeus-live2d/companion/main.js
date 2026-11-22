@@ -49,7 +49,12 @@ let menu = null;
 let activeModelId = '';
 let behaviors = { wander: true, perch: true, cursor: true };
 let hidden = false;
-let voiceReplies = { enabled: false, voice: 'sveta', speed: 1 };
+let voiceReplies = { enabled: false, voice: 'sveta', speed: 1, engine: 'edge', edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15 };
+function voiceExtras(src, dst) {                                // engine and the Edge voice settings
+  if (src.engine === 'edge' || src.engine === 'kokoro') dst.engine = src.engine;
+  if (typeof src.edgeVoice === 'string' && /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(src.edgeVoice)) dst.edgeVoice = src.edgeVoice;
+  for (const k of ['edgeRate', 'edgePitch']) if (typeof src[k] === 'number' && isFinite(src[k])) dst[k] = Math.min(50, Math.max(-50, Math.round(src[k])));
+}
 const VOICES = ['sveta', 'masha', 'dima'];
 let modelScale = 1.0;
 let hotkeys = { microphoneToggle: 'CTRL+ALT+M', curtainToggle: 'CTRL+ALT+H', radioEnabled: false, pushToTalk: 'MOUSE4' };
@@ -94,6 +99,7 @@ function loadPersisted() {
         if (typeof data.voiceReplies.enabled === 'boolean') voiceReplies.enabled = data.voiceReplies.enabled;
         if (typeof data.voiceReplies.voice === 'string' && VOICES.includes(data.voiceReplies.voice)) voiceReplies.voice = data.voiceReplies.voice;
         if (typeof data.voiceReplies.speed === 'number' && isFinite(data.voiceReplies.speed)) voiceReplies.speed = data.voiceReplies.speed;
+        voiceExtras(data.voiceReplies, voiceReplies);
       }
       if (typeof data.modelScale === 'number' && isFinite(data.modelScale) && data.modelScale >= 0.2 && data.modelScale <= 3) modelScale = data.modelScale;
       if (data.hotkeys && typeof data.hotkeys === 'object') {
@@ -162,6 +168,48 @@ async function kokoroEnsure() {
   kokoroPort = port;
   return port;
 }
+// ---- Edge neural voices (online): the same small edge-tts server as live3D (shared port)
+const EDGE_PORT = 58323;
+const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'];
+let edgeProcess = null;
+function edgePython() {
+  for (const c of [process.env.AMADEUS_TTS_PYTHON, 'W:\\amadeus-v2\\tts\\.venv\\Scripts\\python.exe']) if (c && fs.existsSync(c)) return c;
+  return null;
+}
+async function edgeHealthy() {
+  try { const r = await fetch(`http://127.0.0.1:${EDGE_PORT}/health`, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
+}
+let edgeStarting = null;
+async function edgeEnsure() {
+  if (await edgeHealthy()) return true;
+  if (!edgeStarting) {
+    edgeStarting = (async () => {
+      if (!edgeProcess || edgeProcess.exitCode !== null) {
+        const py = edgePython();
+        if (!py) return false;
+        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { stdio: 'ignore', windowsHide: true });
+        edgeProcess.on('error', () => {});
+      }
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) { if (await edgeHealthy()) return true; await new Promise((r) => setTimeout(r, 250)); }
+      return false;
+    })().finally(() => { edgeStarting = null; });
+  }
+  return edgeStarting;
+}
+app.on('will-quit', () => { try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} });
+async function edgeSynthesize(text) {
+  if (!(await edgeEnsure())) throw new Error('Edge-голоса недоступны.');
+  const lim = (v, d) => Math.min(50, Math.max(-50, Math.round(Number.isFinite(Number(v)) ? Number(v) : d)));
+  const res = await fetch(`http://127.0.0.1:${EDGE_PORT}/synthesize`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text, voice: EDGE_VOICES.includes(voiceReplies.edgeVoice) ? voiceReplies.edgeVoice : EDGE_VOICES[0], rate: lim(voiceReplies.edgeRate, 10), pitch: lim(voiceReplies.edgePitch, 15) }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (res.ok) return await res.arrayBuffer();
+  const error = await res.json().catch(() => ({}));
+  throw new Error(error.error || `edge http ${res.status}`);
+}
 async function kokoroSynthesize(text, voice, speed) {
   const wanted = VOICES.includes(voice) ? voice : 'sveta';
   const rate = Math.min(2, Math.max(0.5, Number(speed) || 1));
@@ -227,6 +275,9 @@ function applySettingsPatch(patch) {
       voiceReplies.speed = patch.voiceReplies.speed;
       changed = true;
     }
+    const before = JSON.stringify(voiceReplies);
+    voiceExtras(patch.voiceReplies, voiceReplies);
+    if (JSON.stringify(voiceReplies) !== before) changed = true;
   }
   if (typeof patch.scale === 'number' && isFinite(patch.scale) && patch.scale >= 0.2 && patch.scale <= 3 && Math.abs(patch.scale - modelScale) > 0.0001) {
     modelScale = patch.scale;
@@ -692,6 +743,9 @@ function registerIpc() {
     const text = typeof request?.text === 'string' ? request.text.trim() : '';
     if (!text) return { ok: false, error: 'Пустой текст.' };
     try {
+      if (voiceReplies.engine === 'edge') {
+        try { return { ok: true, audio: await edgeSynthesize(text) }; } catch {}       // offline / Edge down: Kokoro below
+      }
       const audio = await kokoroSynthesize(text, request?.voice, request?.speed);
       return { ok: true, audio };
     } catch (error) {
