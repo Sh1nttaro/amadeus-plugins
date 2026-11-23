@@ -42,21 +42,46 @@ from stdout, then drives the character over `http://127.0.0.1:<port>/command`.
 
 ## Install
 
-Add to the DSH profile (`~/.dsh/profiles/<profile>/package.json`):
+Link the plugin into the DSH profile (`~/.dsh/profiles/<profile>`): `plugins/amadeus-live3d` and
+`node_modules/amadeus-live3d` as junctions to this folder, and in the profile's `package.json`:
 
 ```json
 {
-  "dependencies": { "amadeus-live3d": "file:W:/plugins-dsh/amadeus-live3d" }
+  "dependencies": { "amadeus-live3d": "link:./plugins/amadeus-live3d" },
+  "dsh": { "profile": { "bundles": ["…", "amadeus-live3d"] } }
 }
 ```
 
-Then restart DeepSeek Harness. The plugin spawns the companion on first use.
+Then install the runtime (once per machine, shared with amadeus-live2d) and restart DeepSeek
+Harness. The plugin spawns the companion on first use.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\install-runtime.ps1 -Check   # what is there / missing
+powershell -ExecutionPolicy Bypass -File .\setup\install-runtime.ps1          # install what is missing (needs uv)
+```
+
+See the repository [README](../README.md) for the full install into DSH.
+
+## Runtime folder
+
+The plugin carries only code (including the Kokoro server in `companion/speech`). Everything
+heavy lives in one shared folder, `W:\amadeus-runtime` by default (set `AMADEUS_RUNTIME` to move it):
+
+| Path | What |
+|---|---|
+| `electron\electron.exe` | standalone Electron for the companion window |
+| `python\tts` | Edge voices (edge-tts) + Silero (PyTorch CPU) |
+| `python\kokoro` | Kokoro-ru (onnxruntime, RUAccent, espeak) |
+| `python\stt` | local speech recognition (faster-whisper) |
+| `models\silero\v5_6_ru.pt` | Silero Russian voices |
+| `models\speech\kokoro-ru`, `models\speech\ruaccent` | Kokoro-ru model, voices, espeak data; stress model |
+| `models\whisper` | faster-whisper "small" (downloaded on first local recognition) |
 
 ## Notes / limits
 
 - **No models are bundled** (they are copyrighted; the user imports their own — the same
   import flow amadeus-v2 already had).
-- The companion reuses the DSH app's own Electron binary (`process.execPath`), so no separate
-  Electron download is needed.
+- The companion needs a standalone Electron (`<runtime>\electron`): the DSH binary itself exits
+  at once because of its single-instance lock.
 - Live2D is a separate plugin (proprietary Cubism SDK, handled independently); this plugin is
   3D-only and fully open-source (three.js, MIT).

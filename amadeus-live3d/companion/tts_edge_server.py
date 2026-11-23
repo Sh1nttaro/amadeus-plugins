@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import edge_tts
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 58323
-VOICES = {'ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'}
+VOICES = {'ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural',
+          'fr-FR-VivienneMultilingualNeural', 'pt-BR-ThalitaMultilingualNeural'}
 
 
 async def synth_once(text, voice, rate, pitch):
@@ -27,16 +28,22 @@ async def synth_once(text, voice, rate, pitch):
 
 
 async def synth(text, voice, rate, pitch):
-    """The service now and then answers without audio: try again a couple of times."""
+    """The service now and then answers without audio, mostly when the pitch is shifted: try once
+    more as asked, then without the pitch shift, then without the rate change too."""
     last = None
-    for attempt in range(3):
+    plans = [(rate, pitch), (rate, pitch), (rate, 0), (0, 0)]
+    seen = set()
+    for attempt, (r, p) in enumerate(plans):
+        if (r, p) in seen and attempt > 1:
+            continue
+        seen.add((r, p))
         try:
-            audio = await synth_once(text, voice, rate, pitch)
+            audio = await synth_once(text, voice, r, p)
             if audio:
                 return audio
         except Exception as e:  # noqa: BLE001
             last = e
-        await asyncio.sleep(0.25 * (attempt + 1))
+        await asyncio.sleep(0.15 * (attempt + 1))
     if last:
         raise last
     return b''

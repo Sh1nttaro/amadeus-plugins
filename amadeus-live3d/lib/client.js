@@ -270,35 +270,32 @@ window.__ModuleLoader__.load({
     }
     function VoiceCard() {
       var s = useSettings(); var cfg = s[0], patch = s[1];
-      var vs = react.useState([]); var winVoices = vs[0], setWinVoices = vs[1];
-      react.useEffect(function () { postJson("/amadeus-live3d/command", { name: "list_voices" }).then(function (d) { if (d && d.result && d.result.voices) setWinVoices(d.result.voices); }); }, []);
       if (!cfg) return null;
       var v = cfg.voice || {};
       var on = !!v.enabled;
-      var engine = v.engine || "kokoro";
-      var kokoro = engine === "kokoro", edge = engine === "edge";
-      var EDGE = [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]];
+      var edge = v.engine === "edge", kokoro = v.engine === "kokoro", silero = !edge && !kokoro;   // Silero by default
+      var engineNow = edge ? "edge" : silero ? "silero" : "kokoro";
+      var SILERO = [["xenia", "Ксения (xenia)"], ["baya", "Бая (baya)"], ["aidar", "Айдар (мужской)"], ["eugene", "Евгений (мужской)"]];
+      var EDGE = [["ru-RU-SvetlanaNeural", "Светлана (русский, у Microsoft сейчас нестабильна)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["fr-FR-VivienneMultilingualNeural", "Vivienne (многоязычный)"], ["pt-BR-ThalitaMultilingualNeural", "Thalita (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]];
       var seg = function (key, opts, cur, fmt) { return jsx("div", { className: "aui-seg", children: opts.map(function (x) { return jsx("button", { key: x, type: "button", className: "aui-seg-btn" + (cur === x ? " aui-seg-btn-active" : ""), onClick: function () { var p = {}; p[key] = x; patch({ voice: p }); }, children: fmt(x) }); }) }); };
       var voices = cfg.voices || ["sveta", "masha", "dima"];
       var dev = cfg.voiceDevices || {};
-      var winCurrent = v.voice || ((winVoices.filter(function (x) { return /^ru/i.test(x.lang); })[0] || winVoices[0] || {}).uri || "");
       var speedNow = String(v.speed != null ? v.speed : 1);
-      return auiCard("voice", "Озвучка ответов", "Персонаж читает ответ агента вслух: нейроголоса Edge (онлайн) или Kokoro (локально); губы и субтитры идут в такт голосу. Если голос недоступен — голос Windows.", [
+      return auiCard("voice", "Озвучка ответов", "Персонаж читает ответ агента вслух по предложениям, пока агент ещё пишет: Silero (локально, лёгкий и быстрый), Edge (онлайн) или Kokoro (локально) — все бесплатные; губы и субтитры идут в такт голосу. Звучит только выбранный движок.", [
         auiRow("v-on", "Озвучивать ответы", null, auiSwitch(on, function () { patch({ voice: { enabled: !on } }); })),
         auiRow("v-mute", "Без звука", "Она говорит беззвучно: рот и субтитры двигаются, но вы её не слышите. Та же кнопка с динамиком на круге в режиме пузыря.", auiSwitch(!!v.muted, function () { patch({ voice: { muted: !v.muted } }); }), !on),
-        auiRow("v-engine", "Движок", null, jsx("div", { className: "aui-seg", children: [["edge", "Edge (онлайн)"], ["kokoro", "Kokoro (как в live2D)"], ["windows", "Голоса Windows"]].map(function (m) {
-          return jsx("button", { key: m[0], type: "button", className: "aui-seg-btn" + ((v.engine || "kokoro") === m[0] ? " aui-seg-btn-active" : ""), onClick: function () { patch({ voice: { engine: m[0] } }); }, children: m[1] });
+        auiRow("v-engine", "Движок", null, jsx("div", { className: "aui-seg", children: [["silero", "Silero (локально)"], ["edge", "Edge (онлайн)"], ["kokoro", "Kokoro (как в live2D)"]].map(function (m) {
+          return jsx("button", { key: m[0], type: "button", className: "aui-seg-btn" + (engineNow === m[0] ? " aui-seg-btn-active" : ""), onClick: function () { patch({ voice: { engine: m[0] } }); }, children: m[1] });
         }) }), !on),
         edge ? auiRow("v-evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft.", jsx("select", { className: "aui-select", value: v.edgeVoice || "ru-RU-SvetlanaNeural", onChange: function (e) { patch({ voice: { edgeVoice: e.target.value } }); }, children: EDGE.map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !on) : null,
         edge ? auiRow("v-erate", "Темп", null, seg("edgeRate", [-10, 0, 10, 20], v.edgeRate == null ? 10 : v.edgeRate, function (x) { return (x > 0 ? "+" : "") + x + "%"; }), !on) : null,
         edge ? auiRow("v-epitch", "Высота голоса", null, seg("edgePitch", [0, 8, 15, 25], v.edgePitch == null ? 15 : v.edgePitch, function (x) { return x === 0 ? "обычная" : "+" + x; }), !on) : null,
-        edge ? null : kokoro ? auiRow("v-kvoice", "Голос", null, jsx("select", { className: "aui-select", value: v.kokoroVoice || "sveta", onChange: function (e) { patch({ voice: { kokoroVoice: e.target.value } }); }, children: voices.map(function (n) { return jsx("option", { key: n, value: n, children: n }); }) }), !on)
-          : auiRow("v-voice", "Голос", winVoices.length ? null : "Голоса Windows не найдены.", jsx("select", { className: "aui-select", value: winCurrent, onChange: function (e) { patch({ voice: { voice: e.target.value } }); }, children: winVoices.map(function (x) { return jsx("option", { key: x.uri, value: x.uri, children: x.name.replace(/^Microsoft /, "") }); }) }), !on),
-        edge ? null : kokoro ? auiRow("v-speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (x) {
+        silero ? auiRow("v-svoice", "Голос", "Работает на процессоре, без интернета и видеокарты: ~0.2 с на фразу, ~0.7 ГБ памяти.", jsx("select", { className: "aui-select", value: v.sileroVoice || "xenia", onChange: function (e) { patch({ voice: { sileroVoice: e.target.value } }); }, children: SILERO.map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !on) : null,
+        silero ? auiRow("v-sspeed", "Скорость речи", null, seg("sileroSpeed", [0.9, 1, 1.15, 1.35], v.sileroSpeed == null ? 1 : v.sileroSpeed, function (x) { return x + "×"; }), !on) : null,
+        kokoro ? auiRow("v-kvoice", "Голос", null, jsx("select", { className: "aui-select", value: v.kokoroVoice || "sveta", onChange: function (e) { patch({ voice: { kokoroVoice: e.target.value } }); }, children: voices.map(function (n) { return jsx("option", { key: n, value: n, children: n }); }) }), !on) : null,
+        kokoro ? auiRow("v-speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (x) {
           return jsx("button", { key: x, type: "button", className: "aui-seg-btn" + (speedNow === x ? " aui-seg-btn-active" : ""), onClick: function () { patch({ voice: { speed: Number(x) } }); }, children: x + "×" });
-        }) }), !on)
-          : auiRow("v-rate", "Скорость", null, auiRange(v.rate || 1, 0.5, 2, 0.05, "×", function (x) { patch({ voice: { rate: x } }); }), !on),
-        kokoro || edge ? null : auiRow("v-pitch", "Высота", null, auiRange(v.pitch || 1.05, 0.5, 2, 0.05, "", function (x) { patch({ voice: { pitch: x } }); }), !on),
+        }) }), !on) : null,
         auiRow("v-vol", "Громкость", null, auiRange(dev.outputVolume == null ? 70 : dev.outputVolume, 0, 100, 5, "%", function (x) { patch({ voiceDevices: { outputVolume: x } }); }), !on),
         auiRow("v-react", "Озвучивать реакции", "Фразы на касания тоже звучат вслух.", auiSwitch(v.reactions !== false, function () { patch({ voice: { reactions: v.reactions === false } }); }), !on),
         auiRow("v-test", "Проверить", kokoro ? "Первый запуск Kokoro занимает несколько секунд." : null, jsx("button", { type: "button", className: "aui-btn", onClick: function () { postJson("/amadeus-live3d/command", { name: "say", args: { text: "Привет! Так звучит мой голос." } }); }, children: "▶ Сказать фразу" }), !on)
@@ -473,13 +470,28 @@ window.__ModuleLoader__.load({
       try { var ui = companionChat.ui; if (ui && ui.openSession) ui.openSession(sid); } catch (e) {}
       return true;
     }
+    /** "Алиса, стоп": cancel the running agent turns (as the Stop button does) — her chat and any session streaming now. */
+    function stopAgents(ids) {
+      var remote = companionChat.remote;
+      if (!remote || !remote.session || typeof remote.session.cancel !== "function") { clog("stop: no remote.session.cancel"); return; }
+      var all = ids.slice();
+      if (companionChat.sid && all.indexOf(companionChat.sid) < 0) all.push(companionChat.sid);
+      all.forEach(function (sid) {
+        Promise.resolve(remote.session.cancel({ sessionId: sid })).then(function (r) { if (r && r.ok === false) clog("stop " + sid + ": " + JSON.stringify(r.error)); }).catch(function (e) { clog("stop " + sid + ": " + e); });
+      });
+    }
     var chatPolling = false;
     function pollChatMessage() {
       if (chatPolling) return;
       chatPolling = true;
-      setInterval(function () {
-        fetch("/amadeus-live3d/chat-message").then(function (r) { return r.json(); }).then(function (d) { if (!d || !d.ok || !d.text) return; if (d.send) sendToCompanionChat(d.text).then(function (ok) { if (!ok) injectChat(d.text, true); }); else injectChat(d.text, false); }).catch(function () {});
-      }, 1500);
+      // long poll: a recognised phrase arrives the moment it is ready, not on the next tick
+      (function next() {
+        fetch("/amadeus-live3d/chat-message?wait=1").then(function (r) { return r.json(); }).then(function (d) {
+          if (d && d.ok && d.stop) stopAgents(d.sessions || []);
+          else if (d && d.ok && d.text) { if (d.send) sendToCompanionChat(d.text).then(function (ok) { if (!ok) injectChat(d.text, true); }); else injectChat(d.text, false); }
+          next();
+        }).catch(function () { setTimeout(next, 1500); });
+      })();
     }
     function BehaviorTab() {
       var s = useSettings(); var cfg = s[0], patch = s[1];

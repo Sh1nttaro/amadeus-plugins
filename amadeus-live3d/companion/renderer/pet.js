@@ -2287,6 +2287,14 @@ window.addEventListener('mouseup', (e) => {
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('mousedown', (e) => { if (e.target !== canvas) logIn('down@' + (e.target.id || e.target.tagName), e); }, true);
+// Over the mic / speaker buttons the canvas gets no mousemove, so the cursor froze at its last
+// canvas position and the window could stay click-through: the click fell to the desktop until the
+// 250 ms poll caught up. Track the cursor over any element and make the window clickable at once.
+document.addEventListener('mousemove', (e) => {
+  if (e.target === canvas) return;
+  cursor.x = e.clientX; cursor.y = e.clientY;
+  if (!interactive && overButtons(e.clientX, e.clientY)) hitTest();
+}, true);
 function grab() {
   drag.grabbed = true; drag.hist = [];
   if (pet.sleeping) setEmotion({ surprised: 0.9 }, 2);
@@ -2316,13 +2324,13 @@ let interactive = false;
 function hitTest() {
   if (cursor.x < 0) return;
   let over = false;
-  if (pet.vrm) {
+  if (portrait.on) over = inPortrait(cursor.x, cursor.y) || overButtons(cursor.x, cursor.y);   // bubble mode: pure geometry, no GPU read
+  else if (pet.vrm) {
     const gx = Math.floor(cursor.x * dpr), gy = Math.floor((H - cursor.y) * dpr);
     if (gx >= 0 && gy >= 0 && gx < canvas.width && gy < canvas.height) {
       const gl = renderer.getContext();
       gl.readPixels(gx, gy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
       over = pixel[3] > 24 && !(contactShadow.visible && toWorldY(cursor.y) < pet.y + 3);   // the floor shadow is not her: clicks pass through
-      if (portrait.on) over = inPortrait(cursor.x, cursor.y) || overButtons(cursor.x, cursor.y);
     }
   }
   cursor.over = over;
@@ -2384,7 +2392,8 @@ function onSpeech(args) {
   pet.phase = phase === 'answer' ? (final ? 'idle' : 'answer') : phase === 'idle' ? 'idle' : phase;
   if (phase === 'answer' || phase === 'idle') { /* keep pose */ }
   const voiceOn = !!(settings.voice && settings.voice.enabled);
-  if (phase === 'thinking' || phase === 'tool') stopVoice();
+  // the voice is not cut when she goes on to think / use a tool: the sentence already said plays to the end
+  if (phase === 'answer' && text && voiceOn) speakStream(text, final);
   // lip-sync: speak the new part of the answer (with a voice: the mouth waits for the voice)
   if (phase === 'answer' && text && !voiceOn) {
     if (!text.startsWith(face.speech.slice(0, 30))) { face.speech = ''; face.spoken = 0; }
@@ -2393,7 +2402,6 @@ function onSpeech(args) {
   if (phase === 'answer' && final && text) {
     const cap = captionText(text);
     setEmotion(emotionFromText(text), 6); playStage(cap.acts);
-    if (voiceOn) speak(cap.text);
   }
   if (phase === 'thinking') pet.lastTouch = performance.now();
   if (phase === 'idle') { if (!pet.talking) face.speech = ''; }
@@ -2423,8 +2431,8 @@ function onSpeech(args) {
 // The answer is cut into sentences; each is synthesised by the local Kokoro server (the one the
 // live2D companion uses) while the previous one plays, so speech starts quickly and has no gaps.
 // The mouth opens with the real loudness of the audio, its shape follows the letters of the
-// sentence at the playback position. Windows voices (speechSynthesis) are the fallback.
-const voice = { speaking: false, limit: Infinity, audio: null };
+// sentence at the playback position. Only the chosen engine plays (no switching to another voice).
+const voice = { speaking: false, limit: Infinity, audio: null, queue: [], pump: -1 };
 const aud = { ctx: null, gain: null, analyser: null, buf: null, source: null, gen: 0, sink: null, peak: 0.05 };
 function audioOut() {
   if (!aud.ctx) {
@@ -2448,15 +2456,22 @@ function audioLevel() {
   for (let i = 0; i < aud.buf.length; i++) sum += aud.buf[i] * aud.buf[i];
   return Math.sqrt(sum / aud.buf.length);
 }
-function allVoices() { try { return window.speechSynthesis ? speechSynthesis.getVoices() : []; } catch { return []; } }
-function pickVoice() {
-  const all = allVoices();
-  const want = (settings.voice || {}).voice;
-  return all.find((v) => v.voiceURI === want || v.name === want) || all.find((v) => /^ru/i.test(v.lang)) || all[0] || null;
+/** True when the answer carries something meant for the eyes (a genui widget, a table, JSON, code). */
+const VISUAL_RE = /```|^\s*\|.*\|\s*$/m;
+/**
+ * Text without what is only for the screen: genui widgets (```schemaJson …```) and JSON are silent,
+ * other code is "фрагмент кода", markdown tables are dropped. A block still being streamed (its
+ * closing ``` not there yet) is cut too — before, its JSON was read aloud while the answer streamed.
+ */
+function unblock(text) {
+  return String(text || '')
+    .replace(/```([\w-]*)[^\n]*\n?[\s\S]*?```/g, (m, lang) => (/^(schemajson|json|jsonc|genui|ui|yaml|xml|html|svg|csv|mermaid)$/i.test(lang || '') ? ' ' : ' (фрагмент кода) '))
+    .replace(/```[\s\S]*$/, ' ')
+    .replace(/^\s*\|.*$/gm, ' ')                                                      // table rows (and a row still streaming)
+    .replace(/^\s*("[^"\n]{1,60}"\s*:.*|[{}[\]],?)\s*$/gm, ' ');                      // bare JSON lines outside a block
 }
 function speakable(text) {
-  return String(text || '')
-    .replace(/```[\s\S]*?```/g, ' (фрагмент кода) ')
+  return unblock(text)
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
@@ -2477,33 +2492,84 @@ function speechParts(text) {
   }
   return out;
 }
+/** Speak a whole text now (reactions, test phrase): interrupts what she was saying. */
 function speak(text) {
   const say = speakable(text).slice(0, 2500);
-  if (!say) return false;
+  if (!say || !api.synthesize) return false;
   stopVoice();
-  const v = settings.voice || {};
-  if (v.engine === 'windows' || !api.synthesize) return speakWindows(say);
-  speakKokoro(say, aud.gen);
+  voiceEnqueue(speechParts(say));
   return true;
 }
-async function speakKokoro(say, gen) {
-  const v = settings.voice || {};
-  const parts = speechParts(say);
-  const edge = v.engine === 'edge';
-  const synth = (t) => (edge
-    ? api.synthesize({ engine: 'edge', text: t, voice: v.edgeVoice || 'ru-RU-SvetlanaNeural', rate: v.edgeRate == null ? 10 : v.edgeRate, pitch: v.edgePitch == null ? 15 : v.edgePitch })
-    : api.synthesize({ text: t, voice: v.kokoroVoice || 'sveta', speed: v.speed || 1 })).catch((e) => ({ ok: false, error: String(e) }));
+// Streaming: while the agent is still writing, every finished sentence goes to the voice queue at
+// once, so she starts speaking after the first sentence instead of after the whole answer.
+const vstream = { raw: '', done: 0, said: false, lastFinal: '', lastAt: 0 };
+function speakStream(text, final) {
+  const now = performance.now();
+  if (vstream.lastFinal && now - vstream.lastAt < 5000 && vstream.lastFinal.startsWith(text)) return;   // a repeat / late update of the answer just finished
+  if (final) { vstream.lastFinal = text; vstream.lastAt = now; }
+  if (vstream.stopped) {                                                   // after "стоп": not this answer again
+    if (vstream.stopped === '\u0000' ? now - (vstream.stoppedAt || 0) < 4000 : text.startsWith(vstream.stopped)) return;
+    vstream.stopped = '';
+  }
+  const clean = captionText(text).text;
+  if (!vstream.raw || !text.startsWith(vstream.raw.slice(0, 30))) { vstream.done = 0; vstream.said = false; }   // a new answer / step: queued after what is still playing
+  vstream.raw = text;
+  if (vstream.done > clean.length) vstream.done = clean.length;
+  const rest = clean.slice(vstream.done);
+  let upto = rest.length;
+  if (!final) {
+    // up to the last sentence end followed by more text (the last piece may still grow)
+    upto = 0;
+    const re = /[.!?…:]+["»)]?\s+/g; let m;                          // ":" too — "Вот список:" before a table / list
+    while ((m = re.exec(rest))) upto = m.index + m[0].length;
+    // the very first piece: do not wait for a long sentence to end, cut at a comma
+    if (!upto && vstream.done === 0 && rest.length > 90) { const c = rest.lastIndexOf(', ', 140); if (c > 30) upto = c + 2; }
+    if (upto && upto < 12 && rest.length < 40) upto = 0;               // "1. " / "Да. " alone: wait a little for more
+  }
+  const piece = rest.slice(0, upto).trim();
+  vstream.done += upto;
+  if (piece) { voiceEnqueue(speechParts(piece)); vstream.said = true; }
+  // only a table / widget and no words: a short line instead of silence
+  if (final && !vstream.said && VISUAL_RE.test(text)) voiceEnqueue(['Готово, смотри на экране.']);
+  if (final) { vstream.raw = ''; vstream.said = false; }
+}
+function voiceEnqueue(parts) {
+  if (!parts.length || !api.synthesize) return;
+  voice.queue.push(...parts);
   voice.speaking = true;
-  let next = parts.length ? synth(parts[0]) : null;
-  for (let i = 0; i < parts.length; i++) {
-    const r = await next;
+  if (voice.pump !== aud.gen) voicePump(aud.gen);
+}
+function synthOne(t, engine) {
+  const v = settings.voice || {};
+  return (engine === 'edge'
+    ? api.synthesize({ engine: 'edge', text: t, voice: v.edgeVoice || 'ru-RU-SvetlanaNeural', rate: v.edgeRate == null ? 10 : v.edgeRate, pitch: v.edgePitch == null ? 15 : v.edgePitch })
+    : engine === 'silero'
+      ? api.synthesize({ engine: 'silero', text: t, voice: v.sileroVoice || 'xenia', speed: v.sileroSpeed || 1 })
+      : api.synthesize({ text: t, voice: v.kokoroVoice || 'sveta', speed: v.speed || 1 })).catch((e) => ({ ok: false, error: String(e) }));
+}
+/** Only the chosen engine, never another voice: one retry, then the sentence is skipped. */
+async function synthWithFallback(t) {
+  const engine = ['edge', 'kokoro'].includes((settings.voice || {}).engine) ? settings.voice.engine : 'silero';   // Silero by default
+  let r = await synthOne(t, engine);
+  if (r && r.ok) return r;
+  log('voice ' + engine + ': ' + (r && r.error));
+  r = await synthOne(t, engine);
+  if (!r || !r.ok) log('voice ' + engine + ' retry: ' + (r && r.error));
+  return r;
+}
+/** Plays the queue in order; the next sentence is synthesised while the current one plays. */
+async function voicePump(gen) {
+  voice.pump = gen;
+  const ahead = [];                                                  // [{ t, p }] in flight, in order
+  const fill = () => { while (ahead.length < 2 && voice.queue.length) { const t = voice.queue.shift(); ahead.push({ t, p: synthWithFallback(t) }); } };
+  while (gen === aud.gen) {
+    fill();
+    if (!ahead.length) break;
+    const { t, p } = ahead.shift();
+    const r = await p;
     if (gen !== aud.gen) return;
-    next = i + 1 < parts.length ? synth(parts[i + 1]) : null;
-    if (!r || !r.ok) {
-      log('kokoro: ' + (r && r.error));
-      if (i === 0) { voice.speaking = false; speakWindows(say); return; }   // no Kokoro: Windows voice for the whole answer
-      continue;
-    }
+    fill();
+    if (!r || !r.ok) continue;
     try {
       const ctx = audioOut();
       const buffer = await ctx.decodeAudioData(r.audio);
@@ -2513,42 +2579,23 @@ async function speakKokoro(say, gen) {
         src.buffer = buffer; src.connect(aud.analyser);
         src.onended = resolve;
         aud.source = src;
-        face.speech = parts[i]; face.spoken = 0; face.charT = 0;
+        face.speech = t; face.spoken = 0; face.charT = 0;
         voice.audio = { t0: ctx.currentTime, dur: buffer.duration };
         src.start();
       });
     } catch (e) { log('voice play: ' + (e && e.message)); }
     voice.audio = null;
-    if (gen !== aud.gen) return;
   }
+  if (gen !== aud.gen) return;
+  voice.pump = -1;
   voice.speaking = false;
   face.spoken = face.speech.length;
 }
-function speakWindows(say) {
-  if (!window.speechSynthesis) return false;
-  const v = settings.voice || {}, dev = settings.voiceDevices || {};
-  const u = new SpeechSynthesisUtterance(say);
-  const pv = pickVoice();
-  if (pv) { u.voice = pv; u.lang = pv.lang; }
-  u.rate = v.rate || 1; u.pitch = v.pitch || 1; u.volume = v.muted ? 0 : (dev.outputVolume == null ? 70 : dev.outputVolume) / 100;
-  face.speech = say; face.spoken = 0; face.charT = 0; voice.limit = 0;
-  u.onboundary = (e) => {
-    let len = e.charLength;
-    if (!len) { const rest = say.slice(e.charIndex); const m = rest.search(/[\s,.!?;:]/); len = m < 0 ? rest.length : m; }
-    voice.limit = Math.max(voice.limit, e.charIndex + len);
-    if (face.spoken < e.charIndex) { face.spoken = e.charIndex; face.charT = 0; }
-  };
-  const done = () => { voice.speaking = false; voice.limit = Infinity; if (face.speech === say) face.spoken = face.speech.length; };
-  u.onend = done; u.onerror = done;
-  voice.speaking = true;
-  speechSynthesis.speak(u);
-  return true;
-}
 function stopVoice() {
   aud.gen++;
+  voice.queue = [];
   try { if (aud.source) aud.source.stop(); } catch {}
   aud.source = null; voice.audio = null;
-  try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch {}
   voice.speaking = false; voice.limit = Infinity;
 }
 /** Mouth while an audio sentence plays: letters at the playback position, opening = loudness. */
@@ -2567,7 +2614,6 @@ function audioMouth(m) {
   pet.talking = true;
   return true;
 }
-try { if (window.speechSynthesis) { speechSynthesis.onvoiceschanged = () => {}; allVoices(); } } catch {}
 
 // ------------------------------------------------------------------ microphone (menu: talk to the agent)
 // Same as live2D: record from the chosen microphone, then Whisper turns it into text that goes
@@ -2640,7 +2686,7 @@ if (api.onVoiceToggle) api.onVoiceToggle(() => micToggle());
 // Always on when enabled: a simple voice-activity detector cuts the microphone into phrases. Each
 // phrase goes to the companion process, which recognises it and sends it to the agent only when it
 // names her (or right after she answered). Silent while she speaks, so she does not hear herself.
-const ear = { on: false, stream: null, ctx: null, proc: null, pre: [], buf: [], speaking: false, voiced: 0, silent: 0, total: 0, floor: 0.004, rate: 48000, busy: false, devId: '', followUntil: 0, wasSpeaking: false, quietUntil: 0 };
+const ear = { on: false, stream: null, ctx: null, proc: null, pre: [], buf: [], speaking: false, voiced: 0, silent: 0, total: 0, floor: 0.004, rate: 48000, busy: false, waiting: [], nameUntil: 0, barge: false, devId: '', followUntil: 0, wasSpeaking: false, quietUntil: 0 };
 async function earStart() {
   if (ear.on) return;
   ear.on = true;
@@ -2668,37 +2714,76 @@ function earStop() {
 function earReset() { ear.buf = []; ear.speaking = false; ear.voiced = 0; ear.silent = 0; ear.total = 0; }
 function earChunk(d) {
   const now = performance.now();
-  if (mic.rec || voice.speaking || voice.audio || now < ear.quietUntil) { earReset(); ear.pre = []; return; }   // push-to-talk, or her own voice
+  if (mic.rec) { earReset(); ear.pre = []; return; }                                   // push-to-talk has the microphone
+  // While she speaks the microphone only waits for "стоп": a short, loud phrase (her own voice
+  // leaking from the speakers is quieter and long, so it is dropped before any recognition).
+  const barge = voice.speaking || !!voice.audio || now < ear.quietUntil;
+  if (barge !== ear.barge) { earReset(); ear.pre = []; ear.barge = barge; }
   let sum = 0; for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
   const rms = Math.sqrt(sum / d.length);
-  if (!ear.speaking) ear.floor = clamp(ear.floor * 0.995 + rms * 0.005, 0.0015, 0.05);
-  const thr = Math.max(0.012, ear.floor * 3.2);
+  if (!ear.speaking && !barge) ear.floor = clamp(ear.floor * 0.995 + rms * 0.005, 0.0015, 0.05);
+  const thr = barge ? Math.max(0.035, ear.floor * 8) : Math.max(0.012, ear.floor * 3.2);
   const n = d.length;
   if (!ear.speaking) {
     ear.pre.push(d); while (ear.pre.length * n > 0.45 * ear.rate) ear.pre.shift();          // a little before the onset
     if (rms > thr) ear.voiced += n; else ear.voiced = Math.max(0, ear.voiced - n);
-    if (ear.voiced > 0.16 * ear.rate) { ear.speaking = true; ear.buf = ear.pre.slice(); ear.total = ear.buf.length * n; ear.pre = []; ear.silent = 0; }
+    if (ear.voiced > 0.16 * ear.rate) {
+      ear.speaking = true; ear.buf = ear.pre.slice(); ear.total = ear.buf.length * n; ear.pre = []; ear.silent = 0;
+      if (!barge && api.voiceOnset) api.voiceOnset();                       // the companion reads the screen while the user speaks
+    }
     return;
   }
   ear.buf.push(d); ear.total += n;
   if (rms > thr * 0.8) ear.silent = 0; else ear.silent += n;
-  if (ear.silent > 0.85 * ear.rate || ear.total > 15 * ear.rate) earPhrase();
+  if (barge) {
+    if (ear.total > 3 * ear.rate) { earReset(); return; }                    // too long for "Алиса, стоп": her own speech
+    if (ear.silent > 0.4 * ear.rate) earPhrase(true);
+    return;
+  }
+  if (ear.silent > 0.6 * ear.rate || ear.total > 15 * ear.rate) earPhrase();   // 0.6 s of silence ends the phrase
 }
-async function earPhrase() {
+/** "Стоп" was heard: her voice stops at once, the agent's run is cancelled by the DSH client. */
+function onStopCommand() {
+  stopVoice();
+  vstream.stopped = vstream.raw ? vstream.raw.slice(0, 30) : '\u0000';   // the rest of this answer stays silent
+  vstream.stoppedAt = performance.now();
+  vstream.raw = ''; vstream.done = 0; vstream.said = false;
+  ear.followUntil = 0; ear.nameUntil = 0;
+  setMood('surprised', 1.2, 0.4);
+  line2('🎙 Остановила.');
+}
+async function earPhrase(onlyStop) {
   const chunks = ear.buf, total = ear.total;
   earReset();
-  if (total < 0.6 * ear.rate || ear.busy) return;
+  if (total < (onlyStop ? 0.35 : 0.6) * ear.rate) return;
+  // a phrase said while the previous one is still being recognised waits its turn (not dropped)
+  ear.waiting = ear.waiting || [];
+  const item = { wav: wav16k(chunks, total, ear.rate), onlyStop: !!onlyStop };
+  if (ear.busy) { if (ear.waiting.length < 2) ear.waiting.push(item); return; }
   ear.busy = true;
-  const follow = settings.listen && settings.listen.follow !== false && performance.now() < ear.followUntil;
-  try {
-    const res = await api.voiceListen(wav16k(chunks, total, ear.rate), follow);
-    if (res && res.sent) {
-      ear.followUntil = 0; ear.sentAt = performance.now();
-      pet.lastSeenUser = performance.now(); if (pet.sleeping) wake(true);
-      setMood('thinking', 4, 0.6);
-      if (!subtitlesOn() || !pet.talking) line2('🎙 «' + res.phrase + '»');
-    } else if (res && !res.ok && res.error) console.warn('listen: ' + res.error);
-  } catch (e) { console.warn('listen: ' + e); }
+  let cur = item;
+  while (cur) {
+    const follow = performance.now() < ear.nameUntil || (settings.listen && settings.listen.follow !== false && performance.now() < ear.followUntil);
+    try {
+      const res = await api.voiceListen(cur.wav, follow, cur.onlyStop);
+      if (res && res.stop) onStopCommand();
+      else if (res && res.sent) {
+        ear.followUntil = 0; ear.nameUntil = 0; ear.sentAt = performance.now();
+        pet.lastSeenUser = performance.now(); if (pet.sleeping) wake(true);
+        setMood('thinking', 4, 0.6);
+        if (!subtitlesOn() || !pet.talking) line2('🎙 «' + res.phrase + '»');
+      } else if (res && res.named) {                                       // just her name: the next phrase is for her
+        ear.nameUntil = performance.now() + 7000;
+        pet.lastSeenUser = performance.now(); if (pet.sleeping) wake(true);
+        setMood('surprised', 1.5, 0.4);
+        line2('🎙 Слушаю…');
+      } else if (res && !res.ok && res.error) {
+        console.warn('listen: ' + res.error);
+        if (performance.now() - (ear.errAt || -1e9) > 30000) { ear.errAt = performance.now(); line2('🎙 Не могу распознать: ' + res.error); }   // otherwise the mic looks on but nothing happens
+      }
+    } catch (e) { console.warn('listen: ' + e); }
+    cur = ear.waiting.shift();
+  }
   ear.busy = false;
 }
 function earTick(now) {
@@ -2737,7 +2822,7 @@ const STAGE_RE = /\*([^*\n]{2,40})\*|\(([^()\n]{3,30})\)|\[([^\[\]\n]{3,30})\]/g
 /** Text for captions/voice without markdown and stage directions; the directions are returned too. */
 function captionText(text) {
   const acts = [];
-  const clean = String(text || '').replace(STAGE_RE, (m, a, b, c) => {
+  const clean = unblock(text).replace(STAGE_RE, (m, a, b, c) => {               // no stage directions picked out of JSON / tables
     const w = (a || b || c || '').trim();
     if (STAGE.some(([re]) => re.test(w))) { acts.push(w); return ' '; }
     return a ? w : m;                                   // *emphasis* that is not an action stays as a word
@@ -2956,7 +3041,6 @@ function applyMute() {
   const dev = settings.voiceDevices || {};
   const vol = settings.voice && settings.voice.muted ? 0 : (dev.outputVolume == null ? 70 : dev.outputVolume) / 100;
   if (aud.gain) aud.gain.gain.value = vol;
-  if (settings.voice && settings.voice.muted && window.speechSynthesis && speechSynthesis.speaking) speechSynthesis.cancel();
 }
 let lastSent = 0;
 function placeButtons() {
@@ -3538,7 +3622,6 @@ async function handle(name, a) {
     case 'gesture': { const ok = gesture(a.name) || (ACTIONS[a.name] && (ACTIONS[a.name](), true)); return ok ? { ok: true } : { ok: false, error: 'Нет такого жеста.' }; }
     case 'set_emotion': setEmotion(a.emotions || {}, a.seconds || 8); return { ok: true };
     case 'mood': return setMood(String(a.name || ''), a.seconds || 8, a.weight == null ? 1 : a.weight) ? { ok: true } : { ok: false, error: 'Нет такой эмоции.' };
-    case 'list_voices': return { ok: true, voices: allVoices().map((v) => ({ name: v.name, lang: v.lang, uri: v.voiceURI, local: v.localService })) };
     case 'say': return { ok: speak(String(a.text || 'Привет! Так звучит мой голос.')) };
     case 'mic': if (a.on === false) micStop(a.send !== false); else micToggle(); return { ok: true, recording: !!mic.rec };
     case 'stop_voice': stopVoice(); return { ok: true };

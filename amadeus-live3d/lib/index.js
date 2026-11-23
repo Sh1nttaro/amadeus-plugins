@@ -26,7 +26,10 @@ let failedAt = 0;
 process.once('exit', () => { try { companion?.kill(); } catch {} });
 
 function electronBinary() {
-  const cand = process.env.AMADEUS_COMPANION_ELECTRON || 'W:\\amadeus-v2\\electron\\electron.exe';
+  // A standalone Electron from the shared runtime folder (setup/install-runtime.ps1 puts it there):
+  // the DSH binary itself cannot be used — its single-instance lock makes it exit at once.
+  const runtime = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+  const cand = process.env.AMADEUS_COMPANION_ELECTRON || path.join(runtime, 'electron', 'electron.exe');
   return (cand && existsSync(cand)) ? cand : process.execPath;
 }
 
@@ -86,9 +89,17 @@ function savedActiveModel() {
 
 // ---------------------------------------------------------------- agent speech bridge
 // Same stream as amadeus-live2d: phases (connecting/thinking/tool/answer) + streamed text.
+// Sessions whose agent is running now: "Алиса, стоп" cancels them (the DSH client does the cancel).
+const runningSessions = new Map();                       // session id -> last activity (ms)
+function liveSessions() {
+  const now = Date.now();
+  for (const [id, at] of runningSessions) if (now - at > 30 * 60 * 1000) runningSessions.delete(id);
+  return [...runningSessions.keys()].filter((id) => id && id !== 'default');
+}
 function trackAgentSpeech(ctx) {
   if (typeof ctx.on !== 'function') return;
   const trackers = new Map();
+  const sessionOf = (agent) => (agent && agent.session && agent.session.id) || '';
   const forAgent = (agent) => {
     const id = (agent && agent.session && agent.session.id) || (agent && agent.id) || 'default';
     let t = trackers.get(id);
@@ -111,6 +122,8 @@ function trackAgentSpeech(ctx) {
     const frame = payload && payload.frame;
     if (!frame) return;
     const t = forAgent(payload && payload.agent);
+    const sid = sessionOf(payload && payload.agent);
+    if (sid) runningSessions.set(sid, Date.now());
     if (frame.type === 'start') { t.speech = ''; setPhase(t, 'connecting', 'Подключаюсь…', false); return; }
     if (frame.type === 'end') return;
     const chunk = frame.chunk;
@@ -130,7 +143,10 @@ function trackAgentSpeech(ctx) {
     }
   });
   ctx.on('agent/status', (payload) => {
-    if (!payload || payload.status !== 'idle') return;
+    if (!payload) return;
+    const sid = sessionOf(payload.agent);
+    if (sid) { if (payload.status === 'idle') runningSessions.delete(sid); else runningSessions.set(sid, Date.now()); }
+    if (payload.status !== 'idle') return;
     const t = forAgent(payload.agent);
     t.speech = '';
     if (t.phase === 'answer' || t.phase === 'error') { t.phase = 'idle'; t.status = ''; return; }
@@ -442,11 +458,17 @@ function apply(ctx) {
       if (!model && savedActiveModel()) model = { id: savedActiveModel(), name: savedActiveModel() };
       return { ok: true, path: companionChatDir(), workspaceId: st.workspaceId || '', sessions: st.sessions || {}, model };
     });
-    route('/amadeus-live3d/chat-message', 'GET', async () => (port ? http('/chat-message').catch(() => ({ ok: true, text: '' })) : { ok: true, text: '' }));
+    // long poll: the companion answers as soon as a phrase is recognised (or empty after ~15 s)
+    route('/amadeus-live3d/chat-message', 'GET', async (_b, req) => {
+      const wait = /[?&]wait=1/.test(String(req && req.url || '')) ? 15000 : 0;
+      if (!port) { if (wait) await new Promise((r) => setTimeout(r, 1500)); return { ok: true, text: '' }; }
+      const r = await http('/chat-message' + (wait ? '?wait=' + wait : ''), undefined, wait + 5000).catch(() => ({ ok: true, text: '' }));
+      if (r && r.stop) r.sessions = liveSessions();                 // "Алиса, стоп": what to cancel
+      return r;
+    });
     route('/amadeus-live3d/transcribe', 'POST', (b) => http('/transcribe', b, 90000));
     route('/amadeus-live3d/voice-import', 'POST', (b) => http('/voice-import', b, 60000));
-    route('/amadeus-live3d/voices', 'GET', () => http('/voices'));
-    webServer.register({
+    route('/amadeus-live3d/voices', 'GET', () => http('/voices'));    webServer.register({
       kind: 'exact', path: '/amadeus-live3d/import-upload',
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }

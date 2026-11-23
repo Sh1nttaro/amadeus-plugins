@@ -128,23 +128,19 @@ function persist() {
   } catch {}
 }
 loadPersisted();
+// The plugin carries all of its code (companion/speech is the Kokoro server); the heavy runtime —
+// Electron, Python environments and voice models — is in one shared folder, W:\amadeus-runtime
+// (AMADEUS_RUNTIME), filled by setup/install-runtime.ps1.
+const RUNTIME = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+const runtimePath = (...p) => path.join(RUNTIME, ...p);
+function runtimePython(name) {
+  const py = runtimePath('python', name, 'Scripts', 'python.exe');
+  return fs.existsSync(py) ? py : null;
+}
 let kokoroProcess = null;
 let kokoroPort = null;
-function kokoroPython() {
-  const candidates = [
-    process.env.AMADEUS_PYTHON,
-    'W:\\live2D-character\\.venv\\Scripts\\python.exe',
-    'python.exe',
-  ];
-  for (const c of candidates) {
-    if (!c) continue;
-    if (c === 'python.exe' || fs.existsSync(c)) return c;
-  }
-  return 'python.exe';
-}
-function kokoroRoot() {
-  return process.env.AMADEUS_SPEECH_ROOT || 'W:\\amadeus-v2\\live2d';
-}
+function kokoroPython() { return runtimePython('kokoro') || 'python.exe'; }
+const kokoroVoicesDir = () => runtimePath('models', 'speech', 'kokoro-ru', 'voices');   // the style .bin files the server reads
 async function kokoroEnsure() {
   if (kokoroProcess && kokoroPort) {
     if (kokoroProcess.exitCode === null) return kokoroPort;
@@ -152,7 +148,7 @@ async function kokoroEnsure() {
   }
   const port = 58321;
   const child = spawn(kokoroPython(), ['-m', 'speech.server', String(port)], {
-    cwd: kokoroRoot(), stdio: 'ignore', windowsHide: true,
+    cwd: __dirname, env: { ...process.env, AMADEUS_RUNTIME: RUNTIME }, stdio: 'ignore', windowsHide: true,
   });
   kokoroProcess = child;
   child.on('exit', () => { if (kokoroProcess === child) { kokoroProcess = null; kokoroPort = null; } });
@@ -172,10 +168,7 @@ async function kokoroEnsure() {
 const EDGE_PORT = 58323;
 const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'];
 let edgeProcess = null;
-function edgePython() {
-  for (const c of [process.env.AMADEUS_TTS_PYTHON, 'W:\\amadeus-v2\\tts\\.venv\\Scripts\\python.exe']) if (c && fs.existsSync(c)) return c;
-  return null;
-}
+function edgePython() { return runtimePython('tts'); }
 async function edgeHealthy() {
   try { const r = await fetch(`http://127.0.0.1:${EDGE_PORT}/health`, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
 }
@@ -341,7 +334,7 @@ async function importVoice(body) {
   if (['sveta', 'masha', 'dima'].includes(name)) return { ok: false, error: 'Это имя занято встроенным голосом.' };
   const buf = Buffer.from(data, 'base64');
   if (buf.length < 1000) return { ok: false, error: 'Файл слишком маленький (ожидается .bin со стилем голоса).' };
-  const voicesDir = path.join(kokoroRoot(), 'speech', 'voices');
+  const voicesDir = kokoroVoicesDir();
   fs.mkdirSync(voicesDir, { recursive: true });
   fs.writeFileSync(path.join(voicesDir, name + '.bin'), buf);
   const port = await kokoroEnsure();
@@ -868,7 +861,8 @@ const server = http.createServer((req, res) => {
         // 3. TTS audio via Kokoro-ru (play_speech command drives the renderer's
         //    voice queue → api.synthesize → voice:synthesize → kokoroSynthesize).
         //    Gated by voiceReplies.enabled; falls back to Windows SAPI if Kokoro is down.
-        if (voiceReplies.enabled && final && text && character && !character.webContents.isDestroyed()) {
+        //    Not while hidden: a hidden live2D must not read answers on top of the 3D companion.
+        if (voiceReplies.enabled && !hidden && final && text && character && !character.webContents.isDestroyed()) {
           sendCommand({ name: 'play_speech', args: { parts: [text], voice: voiceReplies.voice, speed: Number(voiceReplies.speed) || 1, append: false, final: true } });
         }
         json(200, { ok: true });

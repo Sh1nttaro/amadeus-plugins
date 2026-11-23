@@ -19,8 +19,10 @@ function logSpeak(entry) { speakLog.push(entry); if (speakLog.length > 100) spea
 function electronBinary() {
   // The DSH host child runs in Node mode; spawning process.execPath (the DSH app
   // itself) re-triggers its single-instance/cache lock and exits immediately.
-  // Prefer a standalone Electron binary, falling back to process.execPath.
-  const cand = process.env.AMADEUS_COMPANION_ELECTRON || 'W:\\amadeus-v2\\electron\\electron.exe';
+  // Prefer a standalone Electron binary from the shared runtime folder (setup/install-runtime.ps1
+  // puts it there), falling back to process.execPath.
+  const runtime = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+  const cand = process.env.AMADEUS_COMPANION_ELECTRON || join(runtime, 'electron', 'electron.exe');
   return (cand && existsSync(cand)) ? cand : process.execPath;
 }
 

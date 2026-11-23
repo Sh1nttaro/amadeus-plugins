@@ -44,8 +44,8 @@ const settings = {
   behaviors: { walk: true, climb: true, sleep: true, cursor: true, hideFullscreen: true, physics: true },
   speechBubble: { enabled: true, mode: 'bubble', hideAfter: 10, backgroundColor: '#211e2a', fontColor: '#f5f3fa', opacity: 0.94, fontSize: 14, orb: {} },
   clipRoles: {},                     // animation file -> role
-  // voice like live2D: Kokoro-ru neural voices (sveta / masha / dima / imported .bin), Windows voices as a fallback
-  voice: { enabled: false, muted: false, edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15, engine: 'kokoro', kokoroVoice: 'sveta', speed: 1, voice: '', rate: 1, pitch: 1.05, volume: 0.9, reactions: true },
+  // voice: Edge neural voices (online) or Kokoro-ru (local, shared with live2D); only the chosen one plays
+  voice: { enabled: false, muted: false, edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15, engine: 'silero', kokoroVoice: 'sveta', speed: 1, sileroVoice: 'xenia', sileroSpeed: 1, reactions: true },
   voiceDevices: { inputDeviceId: '', outputDeviceId: '', inputVolume: 100, outputVolume: 70 },
   radio: false,                                                // push-to-talk button in the settings
   // bubble (portrait) mode: head and shoulders in a round frame in a corner, like Kyndred's watch & play
@@ -58,16 +58,16 @@ const settings = {
 function sanitizeVoice(p) {
   const out = {};
   for (const k of ['enabled', 'reactions', 'muted']) if (typeof p[k] === 'boolean') out[k] = p[k];
-  if (typeof p.voice === 'string') out.voice = p.voice.slice(0, 200);
-  if (p.engine === 'kokoro' || p.engine === 'windows' || p.engine === 'edge') out.engine = p.engine;
+  if (p.engine === 'kokoro' || p.engine === 'edge' || p.engine === 'silero') out.engine = p.engine;
+  else if (p.engine === 'google') out.engine = 'silero';            // the Google engine was removed
+  if (typeof p.sileroVoice === 'string' && SILERO_VOICES.includes(p.sileroVoice)) out.sileroVoice = p.sileroVoice;
+  if (typeof p.sileroSpeed === 'number' && isFinite(p.sileroSpeed)) out.sileroSpeed = clamp(p.sileroSpeed, 0.5, 2);
+  else if (p.engine === 'windows') out.engine = 'edge';                 // Windows voices are gone: Edge is the closest
   if (typeof p.edgeVoice === 'string' && /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(p.edgeVoice)) out.edgeVoice = p.edgeVoice;
   if (typeof p.edgeRate === 'number' && isFinite(p.edgeRate)) out.edgeRate = clamp(Math.round(p.edgeRate), -50, 50);
   if (typeof p.edgePitch === 'number' && isFinite(p.edgePitch)) out.edgePitch = clamp(Math.round(p.edgePitch), -50, 50);
   if (typeof p.kokoroVoice === 'string' && /^[a-z0-9_-]{1,40}$/i.test(p.kokoroVoice)) out.kokoroVoice = p.kokoroVoice;
   if (typeof p.speed === 'number' && isFinite(p.speed)) out.speed = clamp(p.speed, 0.5, 2);
-  if (typeof p.rate === 'number' && isFinite(p.rate)) out.rate = clamp(p.rate, 0.5, 2);
-  if (typeof p.pitch === 'number' && isFinite(p.pitch)) out.pitch = clamp(p.pitch, 0.5, 2);
-  if (typeof p.volume === 'number' && isFinite(p.volume)) out.volume = clamp(p.volume, 0, 1);
   return out;
 }
 function sanitizeDevices(p) {
@@ -153,19 +153,28 @@ function pushSettings() {
 }
 
 // ---------------------------------------------------------------- voice (same pipeline as live2D)
-// TTS: Kokoro-ru, a local Python server (W:\amadeus-v2\live2d\speech) shared with the live2D
-// companion on port 58321 — reused when live2D already started it. STT: Whisper via LiteLLM.
+// The plugin carries all of its code (companion/speech is the Kokoro server); the heavy runtime —
+// Electron, Python environments, voice and recognition models — is in one shared folder,
+// W:\amadeus-runtime (AMADEUS_RUNTIME), filled by setup/install-runtime.ps1:
+//   python\tts (Edge + Silero), python\kokoro, python\stt, models\silero, models\speech, models\whisper
+const RUNTIME = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+const runtimePath = (...p) => path.join(RUNTIME, ...p);
+function runtimePython(name) {
+  const py = runtimePath('python', name, 'Scripts', 'python.exe');
+  return fs.existsSync(py) ? py : null;
+}
+const childEnv = () => ({ ...process.env, AMADEUS_RUNTIME: RUNTIME });
+
+// TTS: Kokoro-ru, a local Python server (companion/speech) shared with the live2D companion on
+// port 58321 — reused when live2D already started it. STT: Whisper via LiteLLM or locally.
 const KOKORO_PORT = 58321;
 let kokoroProcess = null;
-function kokoroRoot() { return process.env.AMADEUS_SPEECH_ROOT || 'W:\\amadeus-v2\\live2d'; }
-function kokoroPython() {
-  for (const c of [process.env.AMADEUS_PYTHON, 'W:\\live2D-character\\.venv\\Scripts\\python.exe']) if (c && fs.existsSync(c)) return c;
-  return 'python.exe';
-}
+const kokoroVoicesDir = () => runtimePath('models', 'speech', 'kokoro-ru', 'voices');   // the style .bin files the server reads
+function kokoroPython() { return runtimePython('kokoro') || 'python.exe'; }
 function kokoroVoices() {
   const out = ['sveta', 'masha', 'dima'];
   try {
-    for (const f of fs.readdirSync(path.join(kokoroRoot(), 'speech', 'voices'))) {
+    for (const f of fs.readdirSync(kokoroVoicesDir())) {
       const n = f.replace(/\.bin$/i, '');
       if (/\.bin$/i.test(f) && !out.includes(n)) out.push(n);
     }
@@ -181,7 +190,7 @@ async function kokoroEnsure() {
   if (!kokoroStarting) {
     kokoroStarting = (async () => {
       if (!kokoroProcess || kokoroProcess.exitCode !== null) {
-        kokoroProcess = spawn(kokoroPython(), ['-m', 'speech.server', String(KOKORO_PORT)], { cwd: kokoroRoot(), stdio: 'ignore', windowsHide: true });
+        kokoroProcess = spawn(kokoroPython(), ['-m', 'speech.server', String(KOKORO_PORT)], { cwd: __dirname, env: childEnv(), stdio: 'ignore', windowsHide: true });
         kokoroProcess.on('error', () => {});
       }
       const deadline = Date.now() + 25000;
@@ -211,12 +220,9 @@ async function kokoroSynthesize(text, voice, speed) {
 // Microsoft's voices through edge-tts in a small local Python server: lively intonation, tempo and
 // pitch adjustable. Russian: Svetlana, Dmitry; multilingual Ava and Emma speak Russian too.
 const EDGE_PORT = 58323;
-const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'];
+const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural', 'fr-FR-VivienneMultilingualNeural', 'pt-BR-ThalitaMultilingualNeural'];
 let edgeProcess = null;
-function edgePython() {
-  for (const c of [process.env.AMADEUS_TTS_PYTHON, 'W:\\amadeus-v2\\tts\\.venv\\Scripts\\python.exe']) if (c && fs.existsSync(c)) return c;
-  return null;
-}
+function edgePython() { return runtimePython('tts'); }
 async function edgeHealthy() {
   try { const r = await fetch(`http://127.0.0.1:${EDGE_PORT}/health`, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
 }
@@ -239,7 +245,7 @@ async function edgeEnsure() {
   return edgeStarting;
 }
 async function edgeSynthesize(text, voice, rate, pitch) {
-  if (!(await edgeEnsure())) throw new Error('Edge-голоса недоступны (нет окружения W:\\amadeus-v2\\tts).');
+  if (!(await edgeEnsure())) throw new Error(`Edge-голоса недоступны (нет окружения ${runtimePath('python', 'tts')}; запустите setup\\install-runtime.ps1).`);
   const res = await fetch(`http://127.0.0.1:${EDGE_PORT}/synthesize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ text, voice: EDGE_VOICES.includes(voice) ? voice : EDGE_VOICES[0], rate: clamp(Number(rate) || 0, -50, 50), pitch: clamp(Number(pitch) || 0, -50, 50) }),
@@ -248,6 +254,53 @@ async function edgeSynthesize(text, voice, rate, pitch) {
   if (res.ok) return await res.arrayBuffer();
   const error = await res.json().catch(() => ({}));
   throw new Error(error.error || `edge http ${res.status}`);
+}
+// ---------------------------------------------------------------- Silero v5 (local, light)
+// Russian voices on the CPU in the same Python environment as Edge: ~0.2 s per sentence,
+// ~0.7 GB of memory, no GPU. The model file is <runtime>\models\silero\v5_6_ru.pt.
+const SILERO_PORT = 58324;
+const SILERO_VOICES = ['xenia', 'baya', 'aidar', 'eugene'];       // kseniya removed: sounds bad
+let sileroProcess = null;
+function sileroModel() {
+  for (const c of [process.env.AMADEUS_SILERO_MODEL, runtimePath('models', 'silero', 'v5_6_ru.pt'), runtimePath('models', 'silero', 'v5_ru.pt')]) if (c && fs.existsSync(c)) return c;
+  return null;
+}
+async function sileroState() {
+  try { const r = await fetch(`http://127.0.0.1:${SILERO_PORT}/health`, { signal: AbortSignal.timeout(800) }); const j = await r.json(); return j.ready ? 'ready' : j.error ? 'error' : 'loading'; } catch { return ''; }
+}
+let sileroStarting = null;
+async function sileroEnsure() {
+  if ((await sileroState()) === 'ready') return true;
+  if (!sileroStarting) {
+    sileroStarting = (async () => {
+      if (!sileroProcess || sileroProcess.exitCode !== null) {
+        const py = edgePython(), model = sileroModel();
+        if (!py || !model) return false;
+        sileroProcess = spawn(py, ['-X', 'utf8', path.join(__dirname, 'tts_silero_server.py'), String(SILERO_PORT), model], { stdio: 'ignore', windowsHide: true });
+        sileroProcess.on('error', () => {});
+      }
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        const st = await sileroState();
+        if (st === 'ready') return true;
+        if (st === 'error') return false;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return false;
+    })().finally(() => { sileroStarting = null; });
+  }
+  return sileroStarting;
+}
+async function sileroSynthesize(text, voice, speed) {
+  if (!(await sileroEnsure())) throw new Error(`Голос Silero недоступен (нет модели в ${runtimePath('models', 'silero')}; запустите setup\\install-runtime.ps1).`);
+  const res = await fetch(`http://127.0.0.1:${SILERO_PORT}/synthesize`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text, voice: SILERO_VOICES.includes(voice) ? voice : 'xenia', speed: clamp(Number(speed) || 1, 0.5, 2) }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (res.ok) return await res.arrayBuffer();
+  const error = await res.json().catch(() => ({}));
+  throw new Error(error.error || `silero http ${res.status}`);
 }
 async function transcribe(dataB64, type, filename) {
   if (typeof dataB64 !== 'string' || !dataB64) return { ok: false, error: 'Нет аудиоданных.' };
@@ -271,7 +324,7 @@ async function importVoice(body) {
   if (!name || typeof body.data !== 'string') return { ok: false, error: 'Нужны имя и данные .bin.' };
   const buf = Buffer.from(body.data, 'base64');
   if (buf.length < 1000) return { ok: false, error: 'Файл голоса пустой.' };
-  const dir = path.join(kokoroRoot(), 'speech', 'voices');
+  const dir = kokoroVoicesDir();
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, name + '.bin'), buf);
   try {
@@ -280,6 +333,11 @@ async function importVoice(body) {
   return { ok: true, name, voices: kokoroVoices() };
 }
 const pendingChat = [];                                         // recognised speech for the DSH composer: { text, send }
+const chatWaiters = new Set();                                  // long-polling /chat-message requests
+function pushChat(m) {
+  pendingChat.push(m);
+  for (const w of [...chatWaiters]) w();
+}
 // ---------------------------------------------------------------- hands-free: "Алиса, …" goes to the agent
 // The renderer listens all the time (voice activity detection) and sends each phrase here. A phrase
 // that names her ("Алиса, глянь…") — or any phrase right after she answered — is recognised, gets a
@@ -287,8 +345,7 @@ const pendingChat = [];                                         // recognised sp
 const STT_PORT = 58322;
 let sttProcess = null;
 function sttPython() {
-  for (const c of [process.env.AMADEUS_STT_PYTHON, 'W:\\amadeus-v2\\stt\\.venv\\Scripts\\python.exe']) if (c && fs.existsSync(c)) return c;
-  return null;
+  return runtimePython('stt');
 }
 async function sttState() {
   try { const r = await fetch(`http://127.0.0.1:${STT_PORT}/health`, { signal: AbortSignal.timeout(800) }); const j = await r.json(); return j.ready ? 'ready' : 'loading'; } catch { return ''; }
@@ -299,7 +356,7 @@ async function sttEnsure(waitMs = 60000) {
   if (!st && (!sttProcess || sttProcess.exitCode !== null)) {
     const py = sttPython();
     if (!py) return false;
-    sttProcess = spawn(py, [path.join(__dirname, 'stt_server.py'), String(STT_PORT), path.resolve(py, '..', '..', '..', 'models')], { stdio: 'ignore', windowsHide: true });
+    sttProcess = spawn(py, [path.join(__dirname, 'stt_server.py'), String(STT_PORT), runtimePath('models', 'whisper')], { env: childEnv(), stdio: 'ignore', windowsHide: true });
     sttProcess.on('error', () => {});
   }
   const deadline = Date.now() + waitMs;
@@ -364,26 +421,52 @@ async function screenNote() {
   text = text.replace(/[￼�​]/g, ' ').replace(/(Закладки|Сохраненные группы вкладок|Bookmarks|Saved tab groups)/g, ' ').replace(/(\s*\|\s*)+/g, ' | ').replace(/\s+/g, ' ').replace(/^[\s|]+|[\s|]+$/g, '').trim().slice(0, 1500);
   return 'на экране: «' + fg.title.slice(0, 140) + '»' + (info && info.app ? ' (' + info.app + ')' : '') + (text ? ' — ' + text : '');
 }
-async function listenPhrase(buf, follow) {
+// The screen note is started as soon as the user begins to speak (voice:onset), so it is ready by
+// the time the phrase is recognised; after recognition it is waited for only briefly.
+let earlyNote = null;
+function startScreenNote() {
+  if (!settings.listen.screen) return;
+  if (earlyNote && Date.now() - earlyNote.at < 3000) return;
+  earlyNote = { at: Date.now(), p: screenNote().catch(() => '') };
+}
+// "Алиса, стоп" — stops the agent's run and her voice. A bare "стоп" counts only as a whole phrase.
+const STOP_RE = /^(стоп|стой|хватит|остановись|остановить|прекрати|отмена|отмени|замолчи|молчи|тихо|stop)( (пожалуйста|всё|все|уже))?[.!…]*$/i;
+function isStop(text) { return STOP_RE.test(String(text || '').trim().replace(/[,]/g, '').replace(/\s+/g, ' ')); }
+/**
+ * onlyStop: the phrase was heard while she was speaking (her own voice may be in it) — the only
+ * thing taken from it is a stop command.
+ */
+async function listenPhrase(buf, follow, onlyStop) {
   if (!buf || buf.length < 8000) return { ok: true, heard: '', sent: false };
-  const notePromise = settings.listen.screen ? screenNote().catch(() => '') : Promise.resolve('');
+  const notePromise = onlyStop || !settings.listen.screen ? Promise.resolve('')
+    : earlyNote && Date.now() - earlyNote.at < 25000 ? earlyNote.p : screenNote().catch(() => '');
+  if (!onlyStop) earlyNote = null;
   const r = await transcribeAny(buf);
   if (!r.ok) return { ok: false, error: r.error || 'не распознано' };
   const heard = r.text;
   if (!heard || heard.replace(/[^a-zа-яё]/gi, '').length < 2) return { ok: true, heard: '', sent: false };
-  let phrase = addressed(heard);
+  const named = addressed(heard);
+  if (isStop(named !== null ? named : heard)) {
+    pushChat({ stop: true });
+    return { ok: true, heard, stop: true, sent: false, via: r.via };
+  }
+  if (onlyStop) return { ok: true, heard, sent: false, via: r.via };
+  let phrase = named;
   if (phrase === null && follow) phrase = heard;
-  if (phrase === null || phrase.replace(/[^a-zа-яё]/gi, '').length < 2) return { ok: true, heard, sent: false, via: r.via };
-  const note = await notePromise;
+  if (phrase === null || phrase.replace(/[^a-zа-яё]/gi, '').length < 2) return { ok: true, heard, sent: false, named: phrase !== null, via: r.via };   // named: only "Алиса" — the next phrase is for her
+  const note = await Promise.race([notePromise, new Promise((r) => setTimeout(() => r(''), 600))]);   // never hold the phrase for the screen
   const text = phrase + '\n\n[🎙 голосом через компаньона' + (note ? ' · ' + note : '') + ']';
-  pendingChat.push({ text, send: true });
+  pushChat({ text, send: true });
   return { ok: true, heard, phrase, sent: true, via: r.via };
 }
 
 /** The first synthesis loads the model (~30 s): do it in the background as soon as the voice is on. */
 let kokoroWarmed = false;
 function kokoroWarm() {
-  if (kokoroWarmed || !settings.voice.enabled || settings.voice.engine === 'windows') return;
+  if (!settings.voice.enabled) return;
+  if (settings.voice.engine === 'edge') { edgeEnsure().catch(() => {}); return; }   // Edge: start its server before the first answer
+  if (settings.voice.engine === 'silero') { sileroEnsure().catch(() => {}); return; }   // Silero: load the model (~3 s)
+  if (kokoroWarmed) return;
   kokoroWarmed = true;
   kokoroSynthesize('Привет.', settings.voice.kokoroVoice, 1).catch(() => { kokoroWarmed = false; });
 }
@@ -802,18 +885,20 @@ function registerIpc() {
     if (!text) return { ok: false, error: 'Пустой текст.' };
     try {
       if (req.engine === 'edge') return { ok: true, audio: await edgeSynthesize(text, req.voice, req.rate, req.pitch) };
+      if (req.engine === 'silero') return { ok: true, audio: await sileroSynthesize(text, req.voice, req.speed) };
       return { ok: true, audio: await kokoroSynthesize(text, req.voice, req.speed) };
     }
     catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   });
-  ipcMain.handle('voice:listen', async (_e, wav, follow) => {
+  ipcMain.on('voice:onset', () => startScreenNote());
+  ipcMain.handle('voice:listen', async (_e, wav, follow, onlyStop) => {
     const buf = Buffer.isBuffer(wav) ? wav : wav instanceof ArrayBuffer ? Buffer.from(wav) : ArrayBuffer.isView(wav) ? Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength) : null;
-    try { return await listenPhrase(buf, !!follow); } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+    try { return await listenPhrase(buf, !!follow, !!onlyStop); } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   });
   ipcMain.handle('voice:turn', async (_e, wav) => {
     const buf = Buffer.isBuffer(wav) ? wav : wav instanceof ArrayBuffer ? Buffer.from(wav) : ArrayBuffer.isView(wav) ? Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength) : null;
     if (!buf || buf.length < 1000) return { ok: false, error: 'Пустая запись.' };
-    try { const r = await transcribeAny(buf); if (r.ok && r.text) pendingChat.push({ text: r.text, send: false }); return { ok: r.ok, text: r.text || '', error: r.error }; }
+    try { const r = await transcribeAny(buf); if (r.ok && r.text) pushChat({ text: r.text, send: false }); return { ok: r.ok, text: r.text || '', error: r.error }; }
     catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   });
 }
@@ -892,8 +977,19 @@ const server = http.createServer(async (req, res) => {
       const img = await win.webContents.capturePage(r);
       json(res, 200, { ok: true, png: img.toPNG().toString('base64') });
     } else if (req.method === 'GET' && route === '/chat-message') {
+      // ?wait=ms: long poll — answers the moment a phrase is recognised instead of on the next poll
+      const wait = clamp(Number(new URL(req.url, 'http://x').searchParams.get('wait')) || 0, 0, 20000);
+      if (!pendingChat.length && wait) {
+        await new Promise((resolve) => {
+          const done = () => { clearTimeout(t); chatWaiters.delete(done); resolve(); };
+          const t = setTimeout(done, wait);
+          chatWaiters.add(done);
+          res.on('close', done);
+        });
+        if (res.destroyed) return;                               // the poller is gone: keep the phrase for the next one
+      }
       const m = pendingChat.shift();
-      json(res, 200, { ok: true, text: m ? m.text : '', send: !!(m && m.send) });
+      json(res, 200, { ok: true, text: m && m.text ? m.text : '', send: !!(m && m.send), stop: !!(m && m.stop) });
     } else if (req.method === 'POST' && route === '/listen-test') {   // debug: a phrase as if it came from the microphone
       try { json(res, 200, await listenPhrase(Buffer.from(String(body.data || ''), 'base64'), !!body.follow)); }
       catch (e) { json(res, 200, { ok: false, error: String((e && e.message) || e) }); }
@@ -927,11 +1023,12 @@ function watchParent() {
 }
 
 app.on('window-all-closed', () => app.quit());
-app.on('will-quit', () => { try { helper && helper.kill(); } catch {} try { if (kokoroProcess && kokoroProcess.exitCode === null) kokoroProcess.kill(); } catch {} try { if (sttProcess && sttProcess.exitCode === null) sttProcess.kill(); } catch {} try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} });
+app.on('will-quit', () => { try { helper && helper.kill(); } catch {} try { if (kokoroProcess && kokoroProcess.exitCode === null) kokoroProcess.kill(); } catch {} try { if (sttProcess && sttProcess.exitCode === null) sttProcess.kill(); } catch {} try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} try { if (sileroProcess && sileroProcess.exitCode === null) sileroProcess.kill(); } catch {} });
 
 app.whenReady().then(async () => {
   loadSettings();
   setTimeout(kokoroWarm, 4000);                                  // voice on: load Kokoro before the first answer
+  setTimeout(() => { if (settings.listen.enabled && !process.env.LITELLM_API_KEY) sttEnsure(1).catch(() => {}); }, 3000);   // listening on: load Whisper before the first phrase
   protocol.handle(SCHEME, (req) => {
     try {
       const u = new URL(req.url);
