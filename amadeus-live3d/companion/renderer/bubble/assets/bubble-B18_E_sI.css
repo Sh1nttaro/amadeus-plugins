@@ -1,0 +1,193 @@
+/* The Qt speech bubble (python_app/desktop/speech_bubble.py): a rounded body with a tail that
+   points at the character's head, a particle orb, a caption, a streaming progress line and a
+   muted hint. The frame itself is drawn as an SVG path in bubble.ts. */
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+}
+
+.bubble {
+  --accent: #b5a3f5;
+  --font: 'Segoe UI', system-ui, sans-serif;
+  --color: #f5f3fa;
+  --muted: rgba(245, 243, 250, 0.65);
+  position: absolute;
+  inset: 0;
+}
+
+.bubble[hidden] {
+  display: none;
+}
+
+.frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+#shadow {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.12);
+  stroke-width: 6;
+  stroke-linejoin: round;
+}
+
+#shape {
+  stroke: var(--accent);
+  stroke-opacity: 0.39;
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+
+.content {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+  font-family: var(--font);
+  color: var(--color);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.orb {
+  width: 50px;
+  height: 50px;
+  flex: none;
+}
+
+.heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.caption {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+
+.status {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.progress {
+  position: relative;
+  height: 2px;
+  flex: none;
+  border-radius: 1px;
+  background: rgba(128, 128, 128, 0.12);
+  overflow: hidden;
+}
+
+.progress[hidden] {
+  display: none;
+}
+
+.progress span {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  width: 34%;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: slide 1.15s ease-in-out infinite;
+}
+
+@keyframes slide {
+  from {
+    left: -34%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+.activity {
+  font-size: 12px;
+  color: var(--muted);
+  flex: none;
+}
+
+.activity[hidden],
+.text[hidden],
+.hint[hidden] {
+  display: none;
+}
+
+.text {
+  font-size: 14px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 6px;
+  margin-right: -6px;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent) 45%, transparent) transparent;
+}
+
+.text::-webkit-scrollbar {
+  width: 4px;
+}
+
+.text::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.text::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+.text::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.hint {
+  font-size: 10px;
+  color: var(--muted);
+  flex: none;
+}
+
+.measure {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  visibility: hidden;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- "show answers" mode: orb-only (no rectangular frame/text) ---- */
+.bubble.orb-only .frame { display: none; }
+.bubble.orb-only .heading,
+.bubble.orb-only .progress,
+.bubble.orb-only .activity,
+.bubble.orb-only .text,
+.bubble.orb-only .hint { display: none; }
+.bubble.orb-only .content { inset: 0; align-items: center; justify-content: center; gap: 0; }
+.bubble.orb-only .orb { width: 120px; height: 120px; }

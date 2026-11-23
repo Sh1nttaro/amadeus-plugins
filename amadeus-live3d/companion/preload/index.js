@@ -1,15 +1,26 @@
-// Minimal preload for the amadeus-live3d companion (3D window only).
-// 3d.html's bridge uses exactly two APIs: onCommand + answer.
+// Preload for the amadeus-live3d overlay (renderer/pet.html).
 const { contextBridge, ipcRenderer } = require('electron');
 
+function subscribe(channel, fn) {
+  const handler = (_event, ...args) => fn(...args);
+  ipcRenderer.on(channel, handler);
+  return () => ipcRenderer.off(channel, handler);
+}
+
 contextBridge.exposeInMainWorld('amadeus', {
-  onCommand: (fn) => {
-    ipcRenderer.on('link:command', (_event, id, command) => fn(id, command));
-  },
-  answer: (id, result) => {
-    ipcRenderer.send('link:answer', id, result);
-  },
-  // minimal window controls (used by nothing yet, harmless + forward-compatible)
-  move: (x, y) => ipcRenderer.send('window:move', x, y),
-  bounds: () => ipcRenderer.invoke('window:bounds'),
+  onCommand: (fn) => subscribe('link:command', fn),
+  answer: (id, result) => ipcRenderer.send('link:answer', id, result),
+  onWorld: (fn) => subscribe('pet:world', fn),
+  onSettings: (fn) => subscribe('pet:settings', fn),
+  settings: () => ipcRenderer.invoke('pet:settings'),
+  cursor: () => ipcRenderer.invoke('pet:cursor'),
+  setInteractive: (on) => ipcRenderer.send('pet:interactive', Boolean(on)),
+  menu: (state) => ipcRenderer.send('pet:menu', state),
+  log: (msg) => ipcRenderer.send('pet:log', String(msg)),
+  synthesize: (req) => ipcRenderer.invoke('voice:synthesize', req),
+  voiceListen: (wav, follow, onlyStop) => ipcRenderer.invoke('voice:listen', wav, !!follow, !!onlyStop),
+  voiceOnset: () => ipcRenderer.send('voice:onset'),
+  voiceTurn: (wav) => ipcRenderer.invoke('voice:turn', wav),
+  onVoiceToggle: (fn) => subscribe('voice:toggle', fn),
+  patch: (p) => ipcRenderer.send('pet:patch', p),
 });

@@ -13,3 +13,15 @@ _live_dsh.png
 
 node_modules/
 *.log
+
+# User content of the 3D companion
+amadeus-live3d/companion/animations/
+
+# Per-user DSH chat binding (workspace / session ids)
+**/companion/chat.json
+
+# What the providers plugin learned from endpoints
+amadeus-providers/data.json
+
+# Per-user harness settings and sessions
+amadeus-harness/data/

@@ -49,7 +49,12 @@ let menu = null;
 let activeModelId = '';
 let behaviors = { wander: true, perch: true, cursor: true };
 let hidden = false;
-let voiceReplies = { enabled: false, voice: 'sveta', speed: 1 };
+let voiceReplies = { enabled: false, voice: 'sveta', speed: 1, engine: 'edge', edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15 };
+function voiceExtras(src, dst) {                                // engine and the Edge voice settings
+  if (src.engine === 'edge' || src.engine === 'kokoro') dst.engine = src.engine;
+  if (typeof src.edgeVoice === 'string' && /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(src.edgeVoice)) dst.edgeVoice = src.edgeVoice;
+  for (const k of ['edgeRate', 'edgePitch']) if (typeof src[k] === 'number' && isFinite(src[k])) dst[k] = Math.min(50, Math.max(-50, Math.round(src[k])));
+}
 const VOICES = ['sveta', 'masha', 'dima'];
 let modelScale = 1.0;
 let hotkeys = { microphoneToggle: 'CTRL+ALT+M', curtainToggle: 'CTRL+ALT+H', radioEnabled: false, pushToTalk: 'MOUSE4' };
@@ -94,6 +99,7 @@ function loadPersisted() {
         if (typeof data.voiceReplies.enabled === 'boolean') voiceReplies.enabled = data.voiceReplies.enabled;
         if (typeof data.voiceReplies.voice === 'string' && VOICES.includes(data.voiceReplies.voice)) voiceReplies.voice = data.voiceReplies.voice;
         if (typeof data.voiceReplies.speed === 'number' && isFinite(data.voiceReplies.speed)) voiceReplies.speed = data.voiceReplies.speed;
+        voiceExtras(data.voiceReplies, voiceReplies);
       }
       if (typeof data.modelScale === 'number' && isFinite(data.modelScale) && data.modelScale >= 0.2 && data.modelScale <= 3) modelScale = data.modelScale;
       if (data.hotkeys && typeof data.hotkeys === 'object') {
@@ -122,23 +128,19 @@ function persist() {
   } catch {}
 }
 loadPersisted();
+// The plugin carries all of its code (companion/speech is the Kokoro server); the heavy runtime —
+// Electron, Python environments and voice models — is in one shared folder, W:\amadeus-runtime
+// (AMADEUS_RUNTIME), filled by setup/install-runtime.ps1.
+const RUNTIME = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+const runtimePath = (...p) => path.join(RUNTIME, ...p);
+function runtimePython(name) {
+  const py = runtimePath('python', name, 'Scripts', 'python.exe');
+  return fs.existsSync(py) ? py : null;
+}
 let kokoroProcess = null;
 let kokoroPort = null;
-function kokoroPython() {
-  const candidates = [
-    process.env.AMADEUS_PYTHON,
-    'W:\\live2D-character\\.venv\\Scripts\\python.exe',
-    'python.exe',
-  ];
-  for (const c of candidates) {
-    if (!c) continue;
-    if (c === 'python.exe' || fs.existsSync(c)) return c;
-  }
-  return 'python.exe';
-}
-function kokoroRoot() {
-  return process.env.AMADEUS_SPEECH_ROOT || 'W:\\amadeus-v2\\live2d';
-}
+function kokoroPython() { return runtimePython('kokoro') || 'python.exe'; }
+const kokoroVoicesDir = () => runtimePath('models', 'speech', 'kokoro-ru', 'voices');   // the style .bin files the server reads
 async function kokoroEnsure() {
   if (kokoroProcess && kokoroPort) {
     if (kokoroProcess.exitCode === null) return kokoroPort;
@@ -146,7 +148,7 @@ async function kokoroEnsure() {
   }
   const port = 58321;
   const child = spawn(kokoroPython(), ['-m', 'speech.server', String(port)], {
-    cwd: kokoroRoot(), stdio: 'ignore', windowsHide: true,
+    cwd: __dirname, env: { ...process.env, AMADEUS_RUNTIME: RUNTIME }, stdio: 'ignore', windowsHide: true,
   });
   kokoroProcess = child;
   child.on('exit', () => { if (kokoroProcess === child) { kokoroProcess = null; kokoroPort = null; } });
@@ -161,6 +163,45 @@ async function kokoroEnsure() {
   }
   kokoroPort = port;
   return port;
+}
+// ---- Edge neural voices (online): the same small edge-tts server as live3D (shared port)
+const EDGE_PORT = 58323;
+const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'];
+let edgeProcess = null;
+function edgePython() { return runtimePython('tts'); }
+async function edgeHealthy() {
+  try { const r = await fetch(`http://127.0.0.1:${EDGE_PORT}/health`, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
+}
+let edgeStarting = null;
+async function edgeEnsure() {
+  if (await edgeHealthy()) return true;
+  if (!edgeStarting) {
+    edgeStarting = (async () => {
+      if (!edgeProcess || edgeProcess.exitCode !== null) {
+        const py = edgePython();
+        if (!py) return false;
+        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { stdio: 'ignore', windowsHide: true });
+        edgeProcess.on('error', () => {});
+      }
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) { if (await edgeHealthy()) return true; await new Promise((r) => setTimeout(r, 250)); }
+      return false;
+    })().finally(() => { edgeStarting = null; });
+  }
+  return edgeStarting;
+}
+app.on('will-quit', () => { try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} });
+async function edgeSynthesize(text) {
+  if (!(await edgeEnsure())) throw new Error('Edge-голоса недоступны.');
+  const lim = (v, d) => Math.min(50, Math.max(-50, Math.round(Number.isFinite(Number(v)) ? Number(v) : d)));
+  const res = await fetch(`http://127.0.0.1:${EDGE_PORT}/synthesize`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text, voice: EDGE_VOICES.includes(voiceReplies.edgeVoice) ? voiceReplies.edgeVoice : EDGE_VOICES[0], rate: lim(voiceReplies.edgeRate, 10), pitch: lim(voiceReplies.edgePitch, 15) }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (res.ok) return await res.arrayBuffer();
+  const error = await res.json().catch(() => ({}));
+  throw new Error(error.error || `edge http ${res.status}`);
 }
 async function kokoroSynthesize(text, voice, speed) {
   const wanted = VOICES.includes(voice) ? voice : 'sveta';
@@ -227,6 +268,9 @@ function applySettingsPatch(patch) {
       voiceReplies.speed = patch.voiceReplies.speed;
       changed = true;
     }
+    const before = JSON.stringify(voiceReplies);
+    voiceExtras(patch.voiceReplies, voiceReplies);
+    if (JSON.stringify(voiceReplies) !== before) changed = true;
   }
   if (typeof patch.scale === 'number' && isFinite(patch.scale) && patch.scale >= 0.2 && patch.scale <= 3 && Math.abs(patch.scale - modelScale) > 0.0001) {
     modelScale = patch.scale;
@@ -290,7 +334,7 @@ async function importVoice(body) {
   if (['sveta', 'masha', 'dima'].includes(name)) return { ok: false, error: 'Это имя занято встроенным голосом.' };
   const buf = Buffer.from(data, 'base64');
   if (buf.length < 1000) return { ok: false, error: 'Файл слишком маленький (ожидается .bin со стилем голоса).' };
-  const voicesDir = path.join(kokoroRoot(), 'speech', 'voices');
+  const voicesDir = kokoroVoicesDir();
   fs.mkdirSync(voicesDir, { recursive: true });
   fs.writeFileSync(path.join(voicesDir, name + '.bin'), buf);
   const port = await kokoroEnsure();
@@ -692,6 +736,9 @@ function registerIpc() {
     const text = typeof request?.text === 'string' ? request.text.trim() : '';
     if (!text) return { ok: false, error: 'Пустой текст.' };
     try {
+      if (voiceReplies.engine === 'edge') {
+        try { return { ok: true, audio: await edgeSynthesize(text) }; } catch {}       // offline / Edge down: Kokoro below
+      }
       const audio = await kokoroSynthesize(text, request?.voice, request?.speed);
       return { ok: true, audio };
     } catch (error) {
@@ -814,7 +861,8 @@ const server = http.createServer((req, res) => {
         // 3. TTS audio via Kokoro-ru (play_speech command drives the renderer's
         //    voice queue → api.synthesize → voice:synthesize → kokoroSynthesize).
         //    Gated by voiceReplies.enabled; falls back to Windows SAPI if Kokoro is down.
-        if (voiceReplies.enabled && final && text && character && !character.webContents.isDestroyed()) {
+        //    Not while hidden: a hidden live2D must not read answers on top of the 3D companion.
+        if (voiceReplies.enabled && !hidden && final && text && character && !character.webContents.isDestroyed()) {
           sendCommand({ name: 'play_speech', args: { parts: [text], voice: voiceReplies.voice, speed: Number(voiceReplies.speed) || 1, append: false, final: true } });
         }
         json(200, { ok: true });
@@ -831,6 +879,10 @@ const server = http.createServer((req, res) => {
     } else if (req.method === 'POST' && route === '/voice-import') {
       try { json(200, await importVoice(body)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
+    } else if (req.method === 'POST' && route === '/provider') {
+      if (typeof body.key === 'string' && body.key) process.env.LITELLM_API_KEY = body.key;
+      if (typeof body.baseUrl === 'string' && /^https?:\/\//.test(body.baseUrl)) process.env.LITELLM_BASE_URL = body.baseUrl;
+      json(200, { ok: true });
     } else if (req.method === 'POST' && route === '/transcribe') {
       try { json(200, await transcribe(body.data, body.type, body.filename)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }

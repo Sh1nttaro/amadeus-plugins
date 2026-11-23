@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { readdirSync, existsSync, readFileSync, createReadStream, createWriteStream, mkdtempSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, createReadStream, createWriteStream, mkdtempSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, basename, extname, sep } from 'node:path';
@@ -19,8 +19,10 @@ function logSpeak(entry) { speakLog.push(entry); if (speakLog.length > 100) spea
 function electronBinary() {
   // The DSH host child runs in Node mode; spawning process.execPath (the DSH app
   // itself) re-triggers its single-instance/cache lock and exits immediately.
-  // Prefer a standalone Electron binary, falling back to process.execPath.
-  const cand = process.env.AMADEUS_COMPANION_ELECTRON || 'W:\\amadeus-v2\\electron\\electron.exe';
+  // Prefer a standalone Electron binary from the shared runtime folder (setup/install-runtime.ps1
+  // puts it there), falling back to process.execPath.
+  const runtime = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
+  const cand = process.env.AMADEUS_COMPANION_ELECTRON || join(runtime, 'electron', 'electron.exe');
   return (cand && existsSync(cand)) ? cand : process.execPath;
 }
 
@@ -35,6 +37,7 @@ function ensureCompanion() {
   if (Date.now() - failedAt < RETRY_AFTER_MS) return Promise.reject(new Error('Компаньон Live2D недоступен, повторю попытку чуть позже.'));
   starting = new Promise((resolve, reject) => {
     const env = { ...process.env, AMADEUS_PARENT_PID: String(process.pid) };
+    if (providerKey && !env.LITELLM_API_KEY) env.LITELLM_API_KEY = providerKey;
     delete env.ELECTRON_RUN_AS_NODE;
     const child = spawn(electronBinary(), [COMPANION_DIR], { stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true });
     companion = child;
@@ -347,7 +350,46 @@ function readJson(req) {
   });
 }
 
+// ---------------------------------------------------------------- the DSH provider key (speech recognition)
+// Whisper runs on the same LiteLLM the user connected in DSH: the key is read from the DSH credential
+// store (never written anywhere) and handed to the companion through its environment / a local route.
+let providerKey = '';
+function watchProviderKey(ctx) {
+  if (typeof ctx.inject !== 'function') return;
+  try {
+    ctx.inject(['credentials'], async (c) => {
+      try {
+        const hit = await c.credentials.resolve('LITELLM_API_KEY');
+        if (hit && typeof hit.value === 'string' && hit.value) {
+          providerKey = hit.value;
+          if (companion && port) http('/provider', { key: providerKey }, 5000).catch(() => {});
+        }
+      } catch {}
+    });
+  } catch {}
+}
+
+
+// ---------------------------------------------------------------- the companion's own chat
+// A DSH Workspace "live2D" (a folder next to the default workspace) with one chat per character,
+// titled with the character's name. Voice messages and the menu's text box go there.
+const CHAT_FILE = join(COMPANION_DIR, 'chat.json');
+const clientLog = [];
+function companionChatDir() {
+  let base = join(homedir(), 'Documents', 'deepseek-harness');
+  try {
+    const reg = JSON.parse(readFileSync(join(homedir(), '.dsh', 'storages', 'workspace.json'), 'utf8'));
+    const def = reg.tables.workspaces[reg.global.defaultWorkspaceId];
+    if (def && def.path) base = dirname(def.path);
+  } catch {}
+  const dir = join(base, 'live2D');
+  try { mkdirSync(dir, { recursive: true }); } catch {}
+  return dir;
+}
+function readChat() { try { return JSON.parse(readFileSync(CHAT_FILE, 'utf8')); } catch { return { sessions: {} }; } }
+
 function apply(ctx) {
+  watchProviderKey(ctx);
   // Pre-boot the Live2D companion (Electron sidecar) in the background so the
   // first card click does not wait for the ~10s companion boot.
   ensureCompanion().catch(() => {});
@@ -549,6 +591,39 @@ function apply(ctx) {
 
     webServer.register({
       kind: 'exact',
+      path: '/amadeus-live2d/companion-chat',
+      handler: async (req, res) => {
+        try {
+          const st = readChat();
+          if (req.method === 'POST') {                          // remember the Workspace / a character's chat
+            const b = await readJson(req);
+            if (typeof b.workspaceId === 'string') st.workspaceId = b.workspaceId;
+            if (typeof b.modelId === 'string') { st.sessions = st.sessions || {}; if (typeof b.sessionId === 'string' && b.sessionId) st.sessions[b.modelId] = b.sessionId; else delete st.sessions[b.modelId]; }
+            writeFileSync(CHAT_FILE, JSON.stringify(st, null, 2));
+            sendJson(res, 200, { ok: true });
+            return;
+          }
+          if (!activeModelId && companion && port > 0) {
+            try { const r = await http('/active', undefined, 3000); if (typeof r.active === 'string') activeModelId = r.active; } catch {}
+          }
+          let model = null;
+          if (activeModelId) { const m = listModelsHost().find((x) => x.id === activeModelId); model = { id: activeModelId, name: (m && m.name) || activeModelId }; }
+          sendJson(res, 200, { ok: true, path: companionChatDir(), workspaceId: st.workspaceId || '', sessions: st.sessions || {}, model });
+        } catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/client-log',
+      handler: async (req, res) => {
+        if (req.method === 'POST') { const b = await readJson(req); if (b && b.msg) { clientLog.push(new Date().toISOString().slice(11, 19) + ' ' + String(b.msg).slice(0, 600)); if (clientLog.length > 40) clientLog.shift(); } }
+        sendJson(res, 200, { ok: true, log: clientLog });
+      },
+    });
+
+    webServer.register({
+      kind: 'exact',
       path: '/amadeus-live2d/chat-message',
       handler: async (req, res) => {
         if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return; }
@@ -620,17 +695,6 @@ function apply(ctx) {
         const file = join(DOWNLOADS_DIR, name);
         if (!/\.(zip|rar|7z)$/i.test(name) || !existsSync(file)) { sendJson(res, 200, { ok: false, error: 'Файл не найден в папке «Загрузки».' }); return; }
         try { sendJson(res, 200, await http('/import', { paths: [file] }, IMPORT_TIMEOUT)); }
-        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
-      },
-    });
-
-    webServer.register({
-      kind: 'exact',
-      path: '/amadeus-live2d/relabel',
-      handler: async (req, res) => {
-        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
-        const body = await readJson(req);
-        try { sendJson(res, 200, await http('/relabel', { id: body.id })); }
         catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
       },
     });
