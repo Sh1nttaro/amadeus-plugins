@@ -36,9 +36,16 @@ function resize() {
   const q = QUALITY[qualityKey] || 1.5;
   dpr = Math.min((window.devicePixelRatio || 1) * q, 3);
   renderer.setPixelRatio(dpr);
-  renderer.setSize(W, H, false);
-  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  drawArea(0, 0, W, H);
+  camera.clearViewOffset();
   fitCamera();
+}
+/** The part of the screen the canvas covers: all of it, or just the circle in bubble mode. */
+const area = { x: -1, y: -1, w: 0, h: 0, dpr: 0 };
+function drawArea(x, y, w, h) {
+  if (w !== area.w || h !== area.h || dpr !== area.dpr) { renderer.setSize(w, h, false); canvas.style.width = w + 'px'; canvas.style.height = h + 'px'; }
+  if (x !== area.x || y !== area.y) { canvas.style.left = x + 'px'; canvas.style.top = y + 'px'; }
+  area.x = x; area.y = y; area.w = w; area.h = h; area.dpr = dpr;
 }
 // World units are meters (real VRM size, so spring-bone physics behaves); screen logic is in
 // pixels; pet.scale converts (px per meter). The orthographic camera maps meters to pixels.
@@ -2027,6 +2034,7 @@ function onWorld(d) {
   world.windows = d.windows || [];
   world.idle = d.idle || 0;
   world.full = !!d.full;
+  world.faded = !!d.faded;                                             // hidden behind a full-screen app
   world.fg = d.fg;                                                     // a fullscreen app is in front (bubble mode can take over)
   world.ready = true;
   rebuildLedges();
@@ -2238,7 +2246,8 @@ function land(surface, y) {
 const drag = { down: false, grabbed: false, sx: 0, sy: 0, ox: 0, oy: 0, hist: [] };
 const inputLog = []; const logIn = (t, e) => { inputLog.push([Math.round(performance.now()), t, e ? Math.round(e.clientX) : -1, e ? Math.round(e.clientY) : -1, cursor.over ? 1 : 0, interactive ? 1 : 0, drag.down ? 1 : 0]); if (inputLog.length > 60) inputLog.shift(); };
 const petting = { active: false, until: 0, lastX: 0, dir: 0, flips: [] };
-canvas.addEventListener('mousemove', (e) => {
+// on the document: the canvas does not see the mouse over the buttons, nor outside the circle in bubble mode
+document.addEventListener('mousemove', (e) => {
   const moved = Math.hypot(e.clientX - cursor.x, e.clientY - cursor.y);
   const nowM = performance.now(), dtM = nowM - (cursor.tMove || nowM);
   cursor.tMove = nowM;
@@ -2268,7 +2277,8 @@ canvas.addEventListener('mousemove', (e) => {
     }
     petting.lastX = e.clientX;
   }
-});
+  if (!interactive && overButtons(e.clientX, e.clientY)) hitTest();          // the first click on a button must not fall through
+}, true);
 canvas.addEventListener('mousedown', (e) => {
   logIn('down', e);
   if (!cursor.over || overButtons(e.clientX, e.clientY)) return;
@@ -2287,14 +2297,6 @@ window.addEventListener('mouseup', (e) => {
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('mousedown', (e) => { if (e.target !== canvas) logIn('down@' + (e.target.id || e.target.tagName), e); }, true);
-// Over the mic / speaker buttons the canvas gets no mousemove, so the cursor froze at its last
-// canvas position and the window could stay click-through: the click fell to the desktop until the
-// 250 ms poll caught up. Track the cursor over any element and make the window clickable at once.
-document.addEventListener('mousemove', (e) => {
-  if (e.target === canvas) return;
-  cursor.x = e.clientX; cursor.y = e.clientY;
-  if (!interactive && overButtons(e.clientX, e.clientY)) hitTest();
-}, true);
 function grab() {
   drag.grabbed = true; drag.hist = [];
   if (pet.sleeping) setEmotion({ surprised: 0.9 }, 2);
@@ -2345,6 +2347,7 @@ function hitTest() {
 }
 // cursor outside of our forwarded events (e.g. over the taskbar): poll occasionally
 setInterval(async () => {
+  if (settings.hidden || world.faded) return;
   try {
     const p = await api.cursor();
     if (Math.hypot(p.x - cursor.x, p.y - cursor.y) > 2) { cursor.x = p.x; cursor.y = p.y; cursor.t = performance.now(); }
@@ -2389,11 +2392,15 @@ function onSpeech(args) {
   const final = args.final !== false;
   const phase = String(args.phase || 'answer');
   const status = String(args.status || '');
-  pet.phase = phase === 'answer' ? (final ? 'idle' : 'answer') : phase === 'idle' ? 'idle' : phase;
+  if (phase !== 'end') pet.phase = phase === 'answer' ? (final ? 'idle' : 'answer') : phase === 'idle' ? 'idle' : phase;
   if (phase === 'answer' || phase === 'idle') { /* keep pose */ }
   const voiceOn = !!(settings.voice && settings.voice.enabled);
-  // the voice is not cut when she goes on to think / use a tool: the sentence already said plays to the end
-  if (phase === 'answer' && text && voiceOn) speakStream(text, final);
+  const session = String(args.session || 'default');
+  if (args.turn) newTurn(session);
+  // the voice is not cut when she goes on to think / use a tool: what was already said plays to the end
+  if (phase === 'answer' && text && voiceOn) feedStream(session, text, final);
+  else if (phase === 'end') return endStream(session);
+  else stepStream(session);
   // lip-sync: speak the new part of the answer (with a voice: the mouth waits for the voice)
   if (phase === 'answer' && text && !voiceOn) {
     if (!text.startsWith(face.speech.slice(0, 30))) { face.speech = ''; face.spoken = 0; }
@@ -2432,7 +2439,7 @@ function onSpeech(args) {
 // live2D companion uses) while the previous one plays, so speech starts quickly and has no gaps.
 // The mouth opens with the real loudness of the audio, its shape follows the letters of the
 // sentence at the playback position. Only the chosen engine plays (no switching to another voice).
-const voice = { speaking: false, limit: Infinity, audio: null, queue: [], pump: -1 };
+const voice = { speaking: false, limit: Infinity, audio: null, lines: [], pump: -1 };
 const aud = { ctx: null, gain: null, analyser: null, buf: null, source: null, gen: 0, sink: null, peak: 0.05 };
 function audioOut() {
   if (!aud.ctx) {
@@ -2446,6 +2453,7 @@ function audioOut() {
   aud.gain.gain.value = settings.voice && settings.voice.muted ? 0 : (dev.outputVolume == null ? 70 : dev.outputVolume) / 100;
   const sink = dev.outputDeviceId || '';
   if (sink !== aud.sink && aud.ctx.setSinkId) { aud.sink = sink; aud.ctx.setSinkId(sink).catch(() => {}); }
+  clearTimeout(aud.idle);
   if (aud.ctx.state === 'suspended') aud.ctx.resume().catch(() => {});
   return aud.ctx;
 }
@@ -2470,98 +2478,222 @@ function unblock(text) {
     .replace(/^\s*\|.*$/gm, ' ')                                                      // table rows (and a row still streaming)
     .replace(/^\s*("[^"\n]{1,60}"\s*:.*|[{}[\]],?)\s*$/gm, ' ');                      // bare JSON lines outside a block
 }
-function speakable(text) {
-  return unblock(text)
+// Abbreviations said in full. Done here, before the text is cut into sentences: otherwise the dot
+// of "см." or "т.е." ends a sentence in the middle of a phrase.
+const NOT_LETTER = '(?<![А-Яа-яЁёA-Za-z])';
+const ABBREVIATIONS = [
+  [/и\s?т\.\s?д\.(?=\s+[А-ЯЁA-Z])/g, 'и так далее.'], [/и\s?т\.\s?п\.(?=\s+[А-ЯЁA-Z])/g, 'и тому подобное.'], [/и\s?др\.(?=\s+[А-ЯЁA-Z])/g, 'и другие.'],   // it also ends the sentence
+  [/и\s?т\.\s?д\./gi, 'и так далее'], [/и\s?т\.\s?п\./gi, 'и тому подобное'], [/т\.\s?е\./gi, 'то есть'],
+  [/т\.\s?к\./gi, 'так как'], [/т\.\s?н\./gi, 'так называемый'], [/и\s?др\./gi, 'и другие'],
+  [/напр\./gi, 'например'], [/см\.\s*(?=ссылк)/gi, 'смотри '], [/см\./gi, 'смотри'], [/стр\./gi, 'страница'],
+  [/(\d)\s*тыс\./gi, '$1 тысяч'], [/(\d)\s*млн\.?/gi, '$1 миллионов'], [/(\d)\s*млрд\.?/gi, '$1 миллиардов'],
+  [/(\d)\s*руб\./gi, '$1 рублей'], [/(\d)\s*мин\./gi, '$1 минут'], [/(\d)\s*сек\./gi, '$1 секунд'],
+  [/(\d{4})\s*гг?\.(?=\s+[А-ЯЁA-Z])/g, '$1 года.'], [/(\d{4})\s*гг?\.(?=\s|$)/g, '$1 года'],
+].map(([re, to]) => [new RegExp(NOT_LETTER + re.source, re.flags), to]);
+/**
+ * One line of an answer → one phrase: headings, list items and lines without punctuation get their
+ * own full stop, list markers and item numbers are not read ("1. Prism" was "один. призм").
+ */
+function speakableLine(line) {
+  let l = line.trim();
+  if (!l) return '';
+  l = l.replace(/^#{1,6}\s+/, '')                                            // heading
+    .replace(/^>\s*/, '')                                                    // quote
+    .replace(/^(?:[-*+•–—]|\d{1,3}[.)]|[a-zа-я]\))\s+/i, '')                  // list marker / item number
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, ' ссылка ')
+    .replace(/https?:\/\/\S+/g, 'ссылка')
     .replace(/[*_#>|~]+/g, ' ')
     .replace(/\p{Extended_Pictographic}/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+  for (const [re, to] of ABBREVIATIONS) l = l.replace(re, to);
+  l = l.replace(/(?<![А-Яа-яЁё])(смотри|открой|по|на|в)\s+ссылка/gi, (m, w) => w + (/^(по|на|в)$/i.test(w) ? ' ссылке' : ' ссылку'));
+  if (!/[\p{L}\p{N}]/u.test(l)) return '';
+  return /[.!?…:;,]["»)]?$/.test(l) ? l : l + '.';
+}
+function speakable(text) {
+  const lines = unblock(text).split(/\n/);
+  return lines.map(speakableLine).filter(Boolean).join(' ').trim();
 }
 /** Sentences of at most ~220 characters (short ones merged). */
 function speechParts(text) {
   const out = [];
   for (const piece of text.split(/(?<=[.!?…])\s+/)) {
     let rest = piece.trim();
-    while (rest.length > 240) { const cut = Math.max(rest.lastIndexOf(', ', 220), rest.lastIndexOf(' ', 220), 120); out.push(rest.slice(0, cut + 1).trim()); rest = rest.slice(cut + 1).trim(); }
+    while (rest.length > 240) { const comma = rest.lastIndexOf(', ', 220), cut = comma > 100 ? comma : Math.max(rest.lastIndexOf(' ', 220), 120); out.push(rest.slice(0, cut + 1).trim()); rest = rest.slice(cut + 1).trim(); }
     if (!rest) continue;
     if (out.length && out[out.length - 1].length + rest.length < 90) out[out.length - 1] += ' ' + rest; else out.push(rest);
   }
   return out;
 }
-/** Speak a whole text now (reactions, test phrase): interrupts what she was saying. */
+/** Speak a text right now (the test phrase): interrupts the sentence being said. */
 function speak(text) {
   const say = speakable(text).slice(0, 2500);
   if (!say || !api.synthesize) return false;
   stopVoice();
-  voiceEnqueue(speechParts(say));
+  voice.lines.push(...speechParts(say));
+  kickVoice();
   return true;
 }
-// Streaming: while the agent is still writing, every finished sentence goes to the voice queue at
-// once, so she starts speaking after the first sentence instead of after the whole answer.
-const vstream = { raw: '', done: 0, said: false, lastFinal: '', lastAt: 0 };
-function speakStream(text, final) {
-  const now = performance.now();
-  if (vstream.lastFinal && now - vstream.lastAt < 5000 && vstream.lastFinal.startsWith(text)) return;   // a repeat / late update of the answer just finished
-  if (final) { vstream.lastFinal = text; vstream.lastAt = now; }
-  if (vstream.stopped) {                                                   // after "стоп": not this answer again
-    if (vstream.stopped === '\u0000' ? now - (vstream.stoppedAt || 0) < 4000 : text.startsWith(vstream.stopped)) return;
-    vstream.stopped = '';
+/** A short line (the agent's reaction, a touch): said before the rest of the answer, nothing is lost. */
+function speakLine(text) {
+  const say = speakable(text).slice(0, 300);
+  if (!say || !api.synthesize) return false;
+  voice.lines.push(...speechParts(say));
+  kickVoice();
+  return true;
+}
+// ---- answers as they are written. Every chat (session) has its own stream, so two agents writing at
+// once do not mix: one of them has the floor and is read aloud, the next one follows when it is done.
+// A stream remembers how much of the agent's RAW text was already taken (it only grows, so the place
+// is exact); complete lines and sentences are taken as soon as they are there.
+const streams = new Map();                       // session -> { id, raw, done, said, final, muted, queue, at }
+let floor = null;                                // the stream being read aloud
+function streamOf(id) {
+  let st = streams.get(id);
+  if (!st) {
+    if (streams.size > 24) for (const [k, x] of streams) if (x !== floor && !x.queue.length) { streams.delete(k); break; }
+    st = { id, raw: '', done: 0, said: false, final: false, muted: false, queue: [], at: 0 };
+    streams.set(id, st);
   }
-  const clean = captionText(text).text;
-  if (!vstream.raw || !text.startsWith(vstream.raw.slice(0, 30))) { vstream.done = 0; vstream.said = false; }   // a new answer / step: queued after what is still playing
-  vstream.raw = text;
-  if (vstream.done > clean.length) vstream.done = clean.length;
-  const rest = clean.slice(vstream.done);
-  let upto = rest.length;
-  if (!final) {
-    // up to the last sentence end followed by more text (the last piece may still grow)
-    upto = 0;
-    const re = /[.!?…:]+["»)]?\s+/g; let m;                          // ":" too — "Вот список:" before a table / list
-    while ((m = re.exec(rest))) upto = m.index + m[0].length;
-    // the very first piece: do not wait for a long sentence to end, cut at a comma
-    if (!upto && vstream.done === 0 && rest.length > 90) { const c = rest.lastIndexOf(', ', 140); if (c > 30) upto = c + 2; }
-    if (upto && upto < 12 && rest.length < 40) upto = 0;               // "1. " / "Да. " alone: wait a little for more
+  return st;
+}
+const ABBREV_END = /(?:^|[^а-яёa-z])(?:гг|см|др|напр|стр|тыс|млн|млрд|руб|мин|сек|им|ул|ср|рис|[a-zа-яё])\.\s+$/i;
+/** End of the last complete sentence in an unfinished line (0 = none): not inside `code`, (), [], ** or after "т." */
+function sentenceCut(line) {
+  const re = /[.!?…]+["»”)]*\s+/g;
+  let cut = 0, m;
+  while ((m = re.exec(line))) {
+    const head = line.slice(0, m.index + m[0].length), body = head.replace(/^\s*(?:[-*+•–—]|\d{1,3}[.)])\s+/, '');
+    const count = (c) => body.split(c).length - 1;
+    if (!body.trim() || count('`') % 2 || count('*') % 2 || count('(') > count(')') || count('[') > count(']') || ABBREV_END.test(body)) continue;
+    cut = head.length;
   }
-  const piece = rest.slice(0, upto).trim();
-  vstream.done += upto;
-  if (piece) { voiceEnqueue(speechParts(piece)); vstream.said = true; }
+  return cut;
+}
+/** How far the raw text can be taken now: whole lines (not inside a ``` block) and whole sentences of the last one. */
+function safeCut(raw, from) {
+  let cut = from, pos = from, fence = false;
+  for (;;) {
+    const nl = raw.indexOf('\n', pos);
+    const line = raw.slice(pos, nl < 0 ? raw.length : nl);
+    const marks = line.split('```').length - 1;
+    if (nl < 0) {
+      if (!fence && !marks && !/^\s*[|{}[\]"]/.test(line)) {
+        const c = sentenceCut(line);
+        if (c) cut = pos + c;
+        else if (from === 0 && cut === 0 && line.length > 200) {              // a very long first sentence: up to a comma
+          const k = line.lastIndexOf(', ', 180);
+          if (k > 60 && sentenceCut(line.slice(0, k) + '. ') === k + 2) cut = pos + k + 2;
+        }
+      }
+      return cut;
+    }
+    if (marks % 2) fence = !fence;
+    pos = nl + 1;
+    if (!fence) cut = pos;
+  }
+}
+function feedStream(id, text, final) {
+  const st = streamOf(id);
+  if (st.raw && !text.startsWith(st.raw)) {
+    if (!final && st.raw.startsWith(text)) return;                       // an update that arrived late
+    st.raw = ''; st.done = 0; st.said = false; st.final = false;         // the next step of the turn: a new text
+  } else if (st.final && text === st.raw) return;                        // the same answer once more
+  st.raw = text; st.at = performance.now(); st.final = !!final;
+  if (st.muted) { st.done = text.length; return; }
+  const cut = final ? text.length : safeCut(text, st.done);
+  if (cut > st.done) {
+    const parts = speechParts(captionText(text.slice(st.done, cut)).text);
+    st.done = cut;
+    if (parts.length) { st.queue.push(...parts); st.said = true; }
+  }
   // only a table / widget and no words: a short line instead of silence
-  if (final && !vstream.said && VISUAL_RE.test(text)) voiceEnqueue(['Готово, смотри на экране.']);
-  if (final) { vstream.raw = ''; vstream.said = false; }
+  if (final && !st.said && VISUAL_RE.test(text)) { st.queue.push('Готово, смотри на экране.'); st.said = true; }
+  kickVoice();
 }
-function voiceEnqueue(parts) {
-  if (!parts.length || !api.synthesize) return;
-  voice.queue.push(...parts);
-  voice.speaking = true;
-  if (voice.pump !== aud.gen) voicePump(aud.gen);
+/** Thinking / a tool: a finished text is over, the next one starts from its beginning. */
+function stepStream(id) { const st = streams.get(id); if (st && st.final) { st.raw = ''; st.done = 0; st.said = false; st.final = false; } }
+/** The user asked something new in this chat: its previous answer is not read any further. */
+function newTurn(id) {
+  const st = streamOf(id), was = floor === st;
+  st.raw = ''; st.done = 0; st.said = false; st.final = false; st.muted = false; st.queue = [];
+  if (was) { floor = null; stopVoice(); kickVoice(); }
 }
+/** The turn is over; an answer that never got its end was cancelled. */
+function endStream(id) {
+  const st = streams.get(id);
+  if (!st) return;
+  if (st.raw && !st.final) st.queue = [];
+  st.final = true; st.muted = false; st.raw = ''; st.done = 0; st.said = false;
+  kickVoice();
+}
+/** Silence everything: what is queued is dropped and unfinished answers stay silent to their end. */
+function hushAll() {
+  for (const st of streams.values()) { st.queue = []; if (!st.final) st.muted = true; }
+  voice.lines = []; floor = null;
+  stopVoice();
+}
+/** The next sentence to say (with whose it is), or null. Short lines first, then the stream that has the floor. */
+function nextPhrase() {
+  if (voice.lines.length) return voice.lines.shift();
+  if (floor && !floor.queue.length && (floor.final || performance.now() - floor.at > 20000)) floor = null;
+  if (!floor) for (const st of streams.values()) if (st.queue.length) { floor = st; break; }
+  return floor && floor.queue.length ? floor.queue.shift() : null;
+}
+const havePhrases = () => voice.lines.length > 0 || [...streams.values()].some((st) => st.queue.length);
+function kickVoice() { if (api.synthesize && voice.pump !== aud.gen && havePhrases()) voicePump(aud.gen); }
+setInterval(kickVoice, 2000);                    // a stream that went quiet gives the floor up
 function synthOne(t, engine) {
   const v = settings.voice || {};
   return (engine === 'edge'
-    ? api.synthesize({ engine: 'edge', text: t, voice: v.edgeVoice || 'ru-RU-SvetlanaNeural', rate: v.edgeRate == null ? 10 : v.edgeRate, pitch: v.edgePitch == null ? 15 : v.edgePitch })
+    ? api.synthesize({ engine: 'edge', text: t, voice: v.edgeVoice || 'en-US-AvaMultilingualNeural', rate: v.edgeRate == null ? 10 : v.edgeRate, pitch: v.edgePitch == null ? 15 : v.edgePitch })
     : engine === 'silero'
       ? api.synthesize({ engine: 'silero', text: t, voice: v.sileroVoice || 'xenia', speed: v.sileroSpeed || 1 })
       : api.synthesize({ text: t, voice: v.kokoroVoice || 'sveta', speed: v.speed || 1 })).catch((e) => ({ ok: false, error: String(e) }));
 }
-/** Only the chosen engine, never another voice: one retry, then the sentence is skipped. */
+/** Only the chosen engine, never another voice: one retry (Edge retries by itself), then the sentence is skipped. */
 async function synthWithFallback(t) {
   const engine = ['edge', 'kokoro'].includes((settings.voice || {}).engine) ? settings.voice.engine : 'silero';   // Silero by default
   let r = await synthOne(t, engine);
-  if (r && r.ok) return r;
-  log('voice ' + engine + ': ' + (r && r.error));
-  r = await synthOne(t, engine);
-  if (!r || !r.ok) log('voice ' + engine + ' retry: ' + (r && r.error));
+  if (!(r && r.ok) && engine !== 'edge') r = await synthOne(t, engine);
+  if (!(r && r.ok)) log('voice ' + engine + ': ' + (r && r.error));
   return r;
 }
-/** Plays the queue in order; the next sentence is synthesised while the current one plays. */
+/**
+ * How to play one synthesised sentence so that all engines sound alike:
+ * - the engine's own silence before and after the speech is cut off (Kokoro had ~0.3 s + ~0.6 s);
+ * - every sentence gets the same loudness of speech (RMS ≈ −18 dBFS), peaks kept under 0.97 —
+ *   before, each sentence was normalised by its peak and the volume jumped by up to 4 dB;
+ * - the pause after it depends on how it ends: comma < full stop < question / exclamation < "…".
+ */
+const SPEECH_RMS = 0.125;
+function shapeSentence(buffer, text) {
+  const d = buffer.getChannelData(0), rate = buffer.sampleRate, n = d.length;
+  let peak = 0;
+  for (let i = 0; i < n; i += 2) { const v = Math.abs(d[i]); if (v > peak) peak = v; }
+  const thr = Math.max(0.004, peak * 0.03);
+  let first = 0, last = n - 1;
+  while (first < n && Math.abs(d[first]) < thr) first++;
+  while (last > first && Math.abs(d[last]) < thr) last--;
+  if (first >= last) return { offset: 0, duration: buffer.duration, gain: 1, pause: 0.2 };
+  let sum = 0, cnt = 0;
+  for (let i = first; i <= last; i += 4) { const v = d[i]; if (Math.abs(v) > thr) { sum += v * v; cnt++; } }
+  const rms = Math.sqrt(sum / Math.max(1, cnt));
+  const gain = clamp(Math.min(SPEECH_RMS / Math.max(rms, 1e-4), 0.97 / Math.max(peak, 1e-4)), 0.25, 4);
+  const offset = Math.max(0, first / rate - 0.02);
+  const end = Math.min(n / rate, last / rate + 0.05);
+  const tail = String(text || '').trim();
+  const pause = /…["»)]?$/.test(tail) ? 0.45 : /[?!]["»)]?$/.test(tail) ? 0.36 : /[.;]["»)]?$/.test(tail) ? 0.28 : /[,:—–-]$/.test(tail) ? 0.12 : 0.2;
+  return { offset, duration: Math.max(0.05, end - offset), gain, pause };
+}
 async function voicePump(gen) {
-  voice.pump = gen;
+  voice.pump = gen; voice.speaking = true;
+  voice.nextAt = 0;
   const ahead = [];                                                  // [{ t, p }] in flight, in order
-  const fill = () => { while (ahead.length < 2 && voice.queue.length) { const t = voice.queue.shift(); ahead.push({ t, p: synthWithFallback(t) }); } };
+  const fill = () => { while (ahead.length < 2) { const t = nextPhrase(); if (!t) break; ahead.push({ t, p: synthWithFallback(t) }); } };
   while (gen === aud.gen) {
     fill();
     if (!ahead.length) break;
@@ -2569,20 +2701,30 @@ async function voicePump(gen) {
     const r = await p;
     if (gen !== aud.gen) return;
     fill();
-    if (!r || !r.ok) continue;
+    if (!r || !r.ok) {
+      if (performance.now() - (voice.lostAt || -1e9) > 60000) { voice.lostAt = performance.now(); line2('🔇 Голос не ответил — фраза пропущена.'); }
+      continue;
+    }
     try {
       const ctx = audioOut();
       const buffer = await ctx.decodeAudioData(r.audio);
       if (gen !== aud.gen) return;
+      const shape = shapeSentence(buffer, t);
+      const wait = voice.nextAt - performance.now();                  // the pause after the previous sentence
+      if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+      if (gen !== aud.gen) return;
       await new Promise((resolve) => {
         const src = ctx.createBufferSource();
-        src.buffer = buffer; src.connect(aud.analyser);
+        const gain = ctx.createGain();
+        gain.gain.value = shape.gain;
+        src.buffer = buffer; src.connect(gain); gain.connect(aud.analyser);
         src.onended = resolve;
         aud.source = src;
         face.speech = t; face.spoken = 0; face.charT = 0;
-        voice.audio = { t0: ctx.currentTime, dur: buffer.duration };
-        src.start();
+        voice.audio = { t0: ctx.currentTime, dur: shape.duration };
+        src.start(0, shape.offset, shape.duration);
       });
+      voice.nextAt = performance.now() + shape.pause * 1000;
     } catch (e) { log('voice play: ' + (e && e.message)); }
     voice.audio = null;
   }
@@ -2590,10 +2732,11 @@ async function voicePump(gen) {
   voice.pump = -1;
   voice.speaking = false;
   face.spoken = face.speech.length;
+  clearTimeout(aud.idle); aud.idle = setTimeout(() => { if (!voice.speaking && aud.ctx) aud.ctx.suspend().catch(() => {}); }, 20000);   // no audio device work while she is silent
 }
+/** Stops the sentence being said; queues are not touched (see hushAll). */
 function stopVoice() {
   aud.gen++;
-  voice.queue = [];
   try { if (aud.source) aud.source.stop(); } catch {}
   aud.source = null; voice.audio = null;
   voice.speaking = false; voice.limit = Infinity;
@@ -2621,7 +2764,7 @@ function audioMouth(m) {
 const mic = { rec: null };
 async function micToggle() {
   if (mic.rec) return micStop(true);
-  stopVoice();
+  hushAll();
   const dev = settings.voiceDevices || {};
   let stream;
   try {
@@ -2742,12 +2885,9 @@ function earChunk(d) {
   }
   if (ear.silent > 0.6 * ear.rate || ear.total > 15 * ear.rate) earPhrase();   // 0.6 s of silence ends the phrase
 }
-/** "Стоп" was heard: her voice stops at once, the agent's run is cancelled by the DSH client. */
+/** "<Name> стоп" was heard: her voice stops at once, the agent's run is cancelled by the DSH client. */
 function onStopCommand() {
-  stopVoice();
-  vstream.stopped = vstream.raw ? vstream.raw.slice(0, 30) : '\u0000';   // the rest of this answer stays silent
-  vstream.stoppedAt = performance.now();
-  vstream.raw = ''; vstream.done = 0; vstream.said = false;
+  hushAll();
   ear.followUntil = 0; ear.nameUntil = 0;
   setMood('surprised', 1.2, 0.4);
   line2('🎙 Остановила.');
@@ -2765,7 +2905,7 @@ async function earPhrase(onlyStop) {
   while (cur) {
     const follow = performance.now() < ear.nameUntil || (settings.listen && settings.listen.follow !== false && performance.now() < ear.followUntil);
     try {
-      const res = await api.voiceListen(cur.wav, follow, cur.onlyStop);
+      const res = await api.voiceListen(cur.wav, follow, cur.onlyStop, floor ? floor.id : '');
       if (res && res.stop) onStopCommand();
       else if (res && res.sent) {
         ear.followUntil = 0; ear.nameUntil = 0; ear.sentAt = performance.now();
@@ -2800,7 +2940,7 @@ function earTick(now) {
 
 // ------------------------------------------------------------------ subtitles (Kyndred-style output)
 // Instead of the bubble: one or two lines in a small dark pill at the character. Words appear in
-// sync with the voice (Kokoro / Windows) or, without a voice, at a reading pace sentence by
+// sync with the voice or, without a voice, at a reading pace sentence by
 // sentence; while the agent thinks or works, a tiny status pill with dots. Stage directions
 // (*laughs*, (вздыхает)) are taken out of the text and played as gestures.
 const subsEl = document.getElementById('subs');
@@ -2982,7 +3122,7 @@ function portraitPlace() {
   portrait.cy = clamp(portrait.cy, portrait.r + 4, H - portrait.r - 4);
 }
 function enterPortrait(on) {
-  portrait.on = on;
+  portrait.on = on; portrait.clip = '';
   if (on) {
     pet.walkTo = null; pet.after = null; pet.jumpTo = null; pet.yawTarget = 0;
     if (!['idle', 'talk', 'think', 'typing'].includes(pet.state)) { pet.state = 'idle'; pet.stateT = 0; }
@@ -2992,6 +3132,8 @@ function enterPortrait(on) {
   } else {
     canvas.style.clipPath = '';
     ringEl.style.display = 'none';
+    drawArea(0, 0, W, H);
+    camera.clearViewOffset();
     fitCamera();
   }
 }
@@ -3011,11 +3153,14 @@ function portraitTick(dt) {
   const F = portrait.F;
   camera.left = F.x - portrait.cx / s; camera.right = camera.left + W / s;
   camera.bottom = F.y - (H - portrait.cy) / s; camera.top = camera.bottom + H / s;
-  camera.updateProjectionMatrix();
-  const r = portrait.r;
-  canvas.style.clipPath = `circle(${r - 1}px at ${portrait.cx}px ${portrait.cy}px)`;
-  ringEl.style.left = Math.round(portrait.cx - r) + 'px'; ringEl.style.top = Math.round(portrait.cy - r) + 'px';
-  ringEl.style.width = ringEl.style.height = Math.round(2 * r) + 'px';
+  // only the circle is drawn: a small canvas showing that piece of the full-screen view
+  const r = portrait.r, x = Math.round(portrait.cx - r), y = Math.round(portrait.cy - r), d = Math.round(2 * r);
+  drawArea(x, y, d, d);
+  camera.setViewOffset(W, H, x, y, d, d);                                        // (updates the projection)
+  const clip = `circle(${r - 1}px at ${portrait.cx - x}px ${portrait.cy - y}px)`;
+  if (clip !== portrait.clip) { portrait.clip = clip; canvas.style.clipPath = clip; }
+  const ring = x + ',' + y + ',' + d;
+  if (ring !== portrait.ring) { portrait.ring = ring; ringEl.style.left = x + 'px'; ringEl.style.top = y + 'px'; ringEl.style.width = ringEl.style.height = d + 'px'; }
 }
 
 // ------------------------------------------------------------------ bubble buttons: microphone and speaker
@@ -3048,7 +3193,7 @@ function placeButtons() {
   btnMic.style.display = btnSpk.style.display = show ? 'block' : 'none';
   if (!show) return;
   const r = portrait.r + 4;
-  const put = (el, deg) => { const a = deg * Math.PI / 180; el.style.left = Math.round(portrait.cx + Math.sin(a) * r) + 'px'; el.style.top = Math.round(portrait.cy + Math.cos(a) * r) + 'px'; };
+  const put = (el, deg) => { const a = deg * Math.PI / 180, l = Math.round(portrait.cx + Math.sin(a) * r), t = Math.round(portrait.cy + Math.cos(a) * r); if (el.at !== l + ',' + t) { el.at = l + ',' + t; el.style.left = l + 'px'; el.style.top = t + 'px'; } };
   put(btnMic, -38); put(btnSpk, 38);                                         // bottom-left and bottom-right of the ring
   const lst = !!(settings.listen && settings.listen.enabled);
   btnMic.classList.toggle('off', !lst);
@@ -3124,7 +3269,7 @@ function sayLine(text) {
     bubbleFrame.style.display = 'block';
     postBubble({ text, final: true, phase: 'answer', status: '', style: { ...bubbleStyle(), hideAfter: 4 } });
   }
-  if (settings.voice && settings.voice.enabled) speak(text);
+  if (settings.voice && settings.voice.enabled) speakLine(text);
 }
 
 // ------------------------------------------------------------------ what is on the screen
@@ -3216,7 +3361,7 @@ function line(kind, force) {
     postBubble({ text, final: true, phase: 'answer', status: '', style: { ...bubbleStyle(), hideAfter: 3 } });
   }
   const v = settings.voice || {};
-  if (v.enabled && v.reactions !== false) speak(text);
+  if (v.enabled && v.reactions !== false && !voice.speaking) speakLine(text);
 }
 function boneScreen(name) { const b = bone(name); return b ? b.getWorldPosition(new V3()).multiplyScalar(pet.scale) : null; }
 /** Where the click landed: 'face', 'head', 'legs' or 'body'. */
@@ -3338,18 +3483,27 @@ function renderPreview(full) {
 }
 
 // ------------------------------------------------------------------ main loop
-const clock = { t: 0, last: performance.now(), acc: 0 };
+const clock = { t: 0, last: performance.now(), cleared: false };
 let lastHit = 0;
+/** Nothing happens that needs more than 30 frames a second: she stands, sits or sleeps quietly. */
+function quiet() {
+  return !drag.down && !drag.grabbed && !voice.audio && !pet.talking && !pet.gesture && !petting.active && !cursor.over
+    && (pet.sleeping || ((pet.state === 'idle' || pet.state === 'sit_floor' || pet.state === 'sit_edge') && mood.k < 0.1 && (!clips.currentRole || clips.currentRole === 'idle' || clips.currentRole.startsWith('sit'))));
+}
 function frame(now) {
+  if (settings.hidden || world.faded) {                                    // not on the screen: nothing is drawn
+    earTick(now);                                                          // (the microphone still follows its settings)
+    setTimeout(() => requestAnimationFrame(frame), 250);
+    clock.last = now;
+    return;
+  }
   requestAnimationFrame(frame);
-  let dt = Math.min(0.05, (now - clock.last) / 1000);
-  // ~30 fps while sleeping / sitting still, 60 otherwise
-  const lazy = (pet.sleeping || pet.state === 'sit_floor') && !drag.grabbed && !pet.talking;
-  clock.acc += dt;
-  if (lazy && clock.acc < 1 / 30) return;
-  dt = clock.acc; clock.acc = 0;
+  // at most 60 frames a second (30 when quiet) whatever the monitor's rate: it was 143 on a 143 Hz screen
+  if (now - clock.last < (quiet() ? 1000 / 30 : 1000 / 60) - 3) return;
+  const dt = Math.min(0.05, (now - clock.last) / 1000);
   clock.last = now; clock.t += dt;
-  if (!pet.vrm) { renderer.clear(); return; }
+  if (!pet.vrm) { if (!clock.cleared) { renderer.clear(); clock.cleared = true; } earTick(now); return; }
+  clock.cleared = false;
   update(dt, now);
   portraitTick(dt);
   placeButtons();
@@ -3624,7 +3778,7 @@ async function handle(name, a) {
     case 'mood': return setMood(String(a.name || ''), a.seconds || 8, a.weight == null ? 1 : a.weight) ? { ok: true } : { ok: false, error: 'Нет такой эмоции.' };
     case 'say': return { ok: speak(String(a.text || 'Привет! Так звучит мой голос.')) };
     case 'mic': if (a.on === false) micStop(a.send !== false); else micToggle(); return { ok: true, recording: !!mic.rec };
-    case 'stop_voice': stopVoice(); return { ok: true };
+    case 'stop_voice': hushAll(); return { ok: true };
     case 'memory': if (a.reset) { mem.bond = 0.35; mem.wary = 0; mem.dirty = true; saveMem(); } return { ok: true, bond: +mem.bond.toFixed(2), wary: +mem.wary.toFixed(2) };
     case 'touch_test': {                                                   // debug: simulate a touch on a zone
       const h = boneScreen(a.zone === 'legs' ? 'leftLowerLeg' : a.zone === 'body' ? 'chest' : 'head') || new V3(pet.x, pet.y, 0);
@@ -3749,6 +3903,7 @@ function applySettings(s) {
   if (tintChanged) applyShadeTint();
   if (s.look) applyRim();
   if (s.voice || s.voiceDevices) applyMute();
+  if (s.voice && !s.voice.enabled && (voice.speaking || floor)) hushAll();     // the voice was switched off
   if (pet.vrm) loadClips();
 }
 api.onSettings(applySettings);

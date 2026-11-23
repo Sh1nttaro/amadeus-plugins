@@ -85,3 +85,22 @@ heavy lives in one shared folder, `W:\amadeus-runtime` by default (set `AMADEUS_
   at once because of its single-instance lock.
 - Live2D is a separate plugin (proprietary Cubism SDK, handled independently); this plugin is
   3D-only and fully open-source (three.js, MIT).
+
+## Credits and sources
+
+Models and animations are **not bundled** (see above). What was used during development:
+
+- **3D model:** *Captain* (`.vrm`, VRM 1.0) from VRoid Hub — <https://hub.vroid.com/en/characters/5372173277651989086/models/6729427563433839515> — licence from the model metadata: author only,
+  personal non-profit use, no redistribution.
+- **Animations:**
+  - `VRMA_01`–`VRMA_06`: VRoid Project sample set, free — <https://vroid.booth.pm/items/5512385> (format: <https://vrm.dev/en/vrma/>).
+  - `*_MIXAMO_*.fbx`: Mixamo (Adobe) — <https://www.mixamo.com>.
+  - `UAL1_Standard.glb`: Universal Animation Library, CC0 — <https://quaternius.itch.io/universal-animation-library>.
+  - `Rig_Medium_*.glb`: KayKit Character Animations, CC0 — <https://kaylousberg.itch.io/kaykit-character-animations>.
+  - The `.vmd` dances and the Unity pose files carry no source information.
+  - Links were matched by file names and confirmed by search; check the licence inside each downloaded pack.
+- **Free models and animations also sourced from BOOTH:** <https://booth.pm/en/search/free%20live2d>.
+- **More to browse:** VRoid Hub <https://hub.vroid.com> and BOOTH <https://booth.pm> for VRM models, Quaternius <https://quaternius.com/packs.html> for animation packs.
+- **Libraries:** three.js (MIT), @pixiv/three-vrm and three-vrm-animation (MIT, pixiv Inc.; see
+  `companion/renderer/vendor/three-vrm.LICENSE`).
+- Live2D models and credits: see the root README, section "Источники моделей и анимаций".

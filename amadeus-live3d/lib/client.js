@@ -377,11 +377,12 @@ window.__ModuleLoader__.load({
       var ls = cfg.listen || {};
       var wakeTitle = (ls.wake || "алиса").replace(/^./, function (c) { return c.toUpperCase(); });
       return jsx("div", { className: "aui-stack", children: [
-        auiCard("listen", "Обращение «" + wakeTitle + "»", "Микрофон слушает постоянно. Фраза с её именем («" + wakeTitle + ", почему не собирается?») сама уходит агенту в открытый чат DSH — вместе с тем, что у вас на экране. Без имени ничего не отправляется. Распознаёт провайдер DSH (LiteLLM Whisper), без него — локальный whisper.", [
-          auiRow("listen-on", "Слушать всегда", "Пока она говорит, микрофон не слушает, чтобы не услышать саму себя. Включается и в меню по правому клику.", auiSwitch(!!ls.enabled, function () { patch({ listen: { enabled: !ls.enabled } }); })),
+        auiCard("listen", "Обращение «" + wakeTitle + "»", "Микрофон слушает постоянно. Фраза с её именем («" + wakeTitle + ", почему не собирается?») сама уходит агенту в открытый чат DSH — вместе с тем, что у вас на экране. Останавливает её и агента только фраза «" + wakeTitle + " стоп». Речь распознаётся на этом компьютере (Whisper); со своим сервером ниже — на нём.", [
+          auiRow("listen-on", "Слушать всегда", "Пока она говорит, микрофон ждёт только «" + wakeTitle + " стоп». Включается и в меню по правому клику.", auiSwitch(!!ls.enabled, function () { patch({ listen: { enabled: !ls.enabled } }); })),
           auiRow("listen-wake", "Имя", "Слово, на которое она откликается.", jsx("input", { className: "aui-select", type: "text", defaultValue: ls.wake || "алиса", key: ls.wake || "алиса", style: { width: 140 }, onBlur: function (e) { var v = e.target.value.trim(); if (v && v !== ls.wake) patch({ listen: { wake: v } }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } }), !ls.enabled),
           auiRow("listen-screen", "Что на экране", "Добавлять к фразе заголовок и текст активного окна (код, ошибка в терминале, страница). Окна с паролями, банками и приватные вкладки не читаются.", auiSwitch(ls.screen !== false, function () { patch({ listen: { screen: ls.screen === false } }); }), !ls.enabled),
-          auiRow("listen-follow", "Продолжать разговор", "8 секунд после её ответа можно говорить без имени.", auiSwitch(ls.follow !== false, function () { patch({ listen: { follow: ls.follow === false } }); }), !ls.enabled)
+          auiRow("listen-follow", "Продолжать разговор", "8 секунд после её ответа можно говорить без имени.", auiSwitch(ls.follow !== false, function () { patch({ listen: { follow: ls.follow === false } }); }), !ls.enabled),
+          auiRow("listen-url", "Свой сервер распознавания", "Адрес OpenAI-совместимого API (например LiteLLM: https://…/v1) — туда уходят запись голоса и ключ LITELLM_API_KEY из DSH. Пусто — всё распознаётся локально.", jsx("input", { className: "aui-select", type: "text", placeholder: "локально", defaultValue: ls.sttUrl || "", key: "u" + (ls.sttUrl || ""), style: { width: 240 }, onBlur: function (e) { var v = e.target.value.trim(); if (v !== (ls.sttUrl || "") && (!v || /^https?:\/\//.test(v))) patch({ listen: { sttUrl: v } }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } }))
         ]),
         auiCard("mic", "Микрофон и динамик", "Голосовое сообщение агенту: правый клик по персонажу → «Микрофон» (ещё раз — отправить) или режим рации ниже. Речь распознаётся и вставляется в поле ввода.", [
           auiRow("in", "Микрофон", null, deviceSelect("input", dev.inputs, "Микрофон")),
@@ -470,13 +471,11 @@ window.__ModuleLoader__.load({
       try { var ui = companionChat.ui; if (ui && ui.openSession) ui.openSession(sid); } catch (e) {}
       return true;
     }
-    /** "Алиса, стоп": cancel the running agent turns (as the Stop button does) — her chat and any session streaming now. */
+    /** "Алиса, стоп": cancel the agent turn the plugin named (as the Stop button does). */
     function stopAgents(ids) {
       var remote = companionChat.remote;
       if (!remote || !remote.session || typeof remote.session.cancel !== "function") { clog("stop: no remote.session.cancel"); return; }
-      var all = ids.slice();
-      if (companionChat.sid && all.indexOf(companionChat.sid) < 0) all.push(companionChat.sid);
-      all.forEach(function (sid) {
+      ids.forEach(function (sid) {
         Promise.resolve(remote.session.cancel({ sessionId: sid })).then(function (r) { if (r && r.ok === false) clog("stop " + sid + ": " + JSON.stringify(r.error)); }).catch(function (e) { clog("stop " + sid + ": " + e); });
       });
     }
@@ -486,10 +485,12 @@ window.__ModuleLoader__.load({
       chatPolling = true;
       // long poll: a recognised phrase arrives the moment it is ready, not on the next tick
       (function next() {
+        var asked = Date.now();
         fetch("/amadeus-live3d/chat-message?wait=1").then(function (r) { return r.json(); }).then(function (d) {
           if (d && d.ok && d.stop) stopAgents(d.sessions || []);
           else if (d && d.ok && d.text) { if (d.send) sendToCompanionChat(d.text).then(function (ok) { if (!ok) injectChat(d.text, true); }); else injectChat(d.text, false); }
-          next();
+          var empty = !d || !d.ok || (!d.text && !d.stop);
+          if (empty && Date.now() - asked < 1000) setTimeout(next, 1500); else next();      // an instant empty answer (the companion is down): do not spin
         }).catch(function () { setTimeout(next, 1500); });
       })();
     }

@@ -61,13 +61,24 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def from_page(self):
+        """Requests of web pages carry an Origin (or say where they come from); only the companion talks to us."""
+        if self.headers.get('Origin') or self.headers.get('Sec-Fetch-Site') in ('cross-site', 'same-site'):
+            self.send(403, {'ok': False})
+            return True
+        return False
+
     def do_GET(self):
+        if self.from_page():
+            return None
         if self.path.startswith('/health'):
             self.send(200, {'ok': True, 'ready': state['model'] is not None, 'error': state['error'], 'model': MODEL_NAME})
         else:
             self.send(404, {'ok': False})
 
     def do_POST(self):
+        if self.from_page():
+            return None
         if not self.path.startswith('/transcribe'):
             return self.send(404, {'ok': False})
         n = int(self.headers.get('content-length') or 0)

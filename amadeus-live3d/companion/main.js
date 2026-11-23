@@ -24,7 +24,7 @@ const MODELS_DIR = path.join(__dirname, 'models');
 const ANIM_DIR = path.join(__dirname, 'animations');
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 const SCHEME = 'amadeus-3d';
-const MODEL_ID = /^[A-Za-z0-9._-]+$/;
+const MODEL_ID = /^(?!\.+$)[A-Za-z0-9._-]+$/;                 // not "." / "..": those are the folder itself and its parent
 const ANIM_ROLES = ['idle', 'walk', 'sit', 'sit_edge', 'sleep', 'wave', 'dance', 'stretch', 'think', 'happy', 'sad', 'angry', 'surprised', 'jump', 'fall', 'land', 'held', 'talk', 'typing', 'pose', 'extra'];
 
 protocol.registerSchemesAsPrivileged([
@@ -45,13 +45,13 @@ const settings = {
   speechBubble: { enabled: true, mode: 'bubble', hideAfter: 10, backgroundColor: '#211e2a', fontColor: '#f5f3fa', opacity: 0.94, fontSize: 14, orb: {} },
   clipRoles: {},                     // animation file -> role
   // voice: Edge neural voices (online) or Kokoro-ru (local, shared with live2D); only the chosen one plays
-  voice: { enabled: false, muted: false, edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15, engine: 'silero', kokoroVoice: 'sveta', speed: 1, sileroVoice: 'xenia', sileroSpeed: 1, reactions: true },
+  voice: { enabled: false, muted: false, edgeVoice: 'en-US-AvaMultilingualNeural', edgeRate: 10, edgePitch: 15, engine: 'silero', kokoroVoice: 'sveta', speed: 1, sileroVoice: 'xenia', sileroSpeed: 1, reactions: true },
   voiceDevices: { inputDeviceId: '', outputDeviceId: '', inputVolume: 100, outputVolume: 70 },
   radio: false,                                                // push-to-talk button in the settings
   // bubble (portrait) mode: head and shoulders in a round frame in a corner, like Kyndred's watch & play
   portrait: { enabled: false, auto: true, size: 220, x: -1, y: -1 },
   // hands-free: always listening, phrases with her name go to the agent with a note on the screen
-  listen: { enabled: false, wake: 'алиса', screen: true, follow: true },
+  listen: { enabled: false, wake: 'алиса', screen: true, follow: true, sttUrl: '' },   // sttUrl: the user's own OpenAI-compatible server for Whisper ('' = recognise locally)
   touch: { enabled: true, lines: true },                       // pat / boop / poke reactions and their little phrases
   look: { shadow: true, rim: true, symbols: true },             // contact shadow under the feet, soft rim light, emotion symbols
 };
@@ -59,10 +59,9 @@ function sanitizeVoice(p) {
   const out = {};
   for (const k of ['enabled', 'reactions', 'muted']) if (typeof p[k] === 'boolean') out[k] = p[k];
   if (p.engine === 'kokoro' || p.engine === 'edge' || p.engine === 'silero') out.engine = p.engine;
-  else if (p.engine === 'google') out.engine = 'silero';            // the Google engine was removed
+  else if (p.engine === 'google' || p.engine === 'windows') out.engine = 'silero';   // engines that no longer exist
   if (typeof p.sileroVoice === 'string' && SILERO_VOICES.includes(p.sileroVoice)) out.sileroVoice = p.sileroVoice;
   if (typeof p.sileroSpeed === 'number' && isFinite(p.sileroSpeed)) out.sileroSpeed = clamp(p.sileroSpeed, 0.5, 2);
-  else if (p.engine === 'windows') out.engine = 'edge';                 // Windows voices are gone: Edge is the closest
   if (typeof p.edgeVoice === 'string' && /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(p.edgeVoice)) out.edgeVoice = p.edgeVoice;
   if (typeof p.edgeRate === 'number' && isFinite(p.edgeRate)) out.edgeRate = clamp(Math.round(p.edgeRate), -50, 50);
   if (typeof p.edgePitch === 'number' && isFinite(p.edgePitch)) out.edgePitch = clamp(Math.round(p.edgePitch), -50, 50);
@@ -78,6 +77,7 @@ function sanitizeDevices(p) {
 }
 function sanitizeListen(p) {
   const out = pickBools(p, ['enabled', 'screen', 'follow']);
+  if (typeof p.sttUrl === 'string' && (p.sttUrl === '' || /^https?:\/\/[^\s]{3,300}$/.test(p.sttUrl))) out.sttUrl = p.sttUrl.replace(/\/+$/, '');
   if (typeof p.wake === 'string') { const w = p.wake.toLowerCase().replace(/[^a-zа-яё ]/gi, '').trim().slice(0, 24); if (w.length >= 3) out.wake = w; }
   return out;
 }
@@ -142,7 +142,7 @@ function applySettingsPatch(p) {
   if (p.voiceDevices && typeof p.voiceDevices === 'object') Object.assign(settings.voiceDevices, sanitizeDevices(p.voiceDevices));
   if (typeof p.radio === 'boolean') settings.radio = p.radio;
   if (p.portrait && typeof p.portrait === 'object') Object.assign(settings.portrait, sanitizePortrait(p.portrait));
-  if (p.listen && typeof p.listen === 'object') { Object.assign(settings.listen, sanitizeListen(p.listen)); if (settings.listen.enabled && !process.env.LITELLM_API_KEY) sttEnsure(1).catch(() => {}); }
+  if (p.listen && typeof p.listen === 'object') { Object.assign(settings.listen, sanitizeListen(p.listen)); if (settings.listen.enabled && !useProviderStt()) sttEnsure(1).catch(() => {}); }
   saveSettings();
   pushSettings();
   return publicSettings();
@@ -163,7 +163,8 @@ function runtimePython(name) {
   const py = runtimePath('python', name, 'Scripts', 'python.exe');
   return fs.existsSync(py) ? py : null;
 }
-const childEnv = () => ({ ...process.env, AMADEUS_RUNTIME: RUNTIME });
+/** Environment of the local voice / recognition servers: they never need the user's API key. */
+const childEnv = () => { const e = { ...process.env, AMADEUS_RUNTIME: RUNTIME }; delete e.LITELLM_API_KEY; return e; };
 
 // TTS: Kokoro-ru, a local Python server (companion/speech) shared with the live2D companion on
 // port 58321 — reused when live2D already started it. STT: Whisper via LiteLLM or locally.
@@ -171,8 +172,9 @@ const KOKORO_PORT = 58321;
 let kokoroProcess = null;
 const kokoroVoicesDir = () => runtimePath('models', 'speech', 'kokoro-ru', 'voices');   // the style .bin files the server reads
 function kokoroPython() { return runtimePython('kokoro') || 'python.exe'; }
+const BUILTIN_VOICES = ['sveta', 'masha', 'dima'];
 function kokoroVoices() {
-  const out = ['sveta', 'masha', 'dima'];
+  const out = [...BUILTIN_VOICES];
   try {
     for (const f of fs.readdirSync(kokoroVoicesDir())) {
       const n = f.replace(/\.bin$/i, '');
@@ -234,7 +236,7 @@ async function edgeEnsure() {
       if (!edgeProcess || edgeProcess.exitCode !== null) {
         const py = edgePython();
         if (!py) return false;
-        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { stdio: 'ignore', windowsHide: true });
+        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { env: childEnv(), stdio: 'ignore', windowsHide: true });
         edgeProcess.on('error', () => {});
       }
       const deadline = Date.now() + 15000;
@@ -276,7 +278,7 @@ async function sileroEnsure() {
       if (!sileroProcess || sileroProcess.exitCode !== null) {
         const py = edgePython(), model = sileroModel();
         if (!py || !model) return false;
-        sileroProcess = spawn(py, ['-X', 'utf8', path.join(__dirname, 'tts_silero_server.py'), String(SILERO_PORT), model], { stdio: 'ignore', windowsHide: true });
+        sileroProcess = spawn(py, ['-X', 'utf8', path.join(__dirname, 'tts_silero_server.py'), String(SILERO_PORT), model], { env: childEnv(), stdio: 'ignore', windowsHide: true });
         sileroProcess.on('error', () => {});
       }
       const deadline = Date.now() + 30000;
@@ -302,12 +304,16 @@ async function sileroSynthesize(text, voice, speed) {
   const error = await res.json().catch(() => ({}));
   throw new Error(error.error || `silero http ${res.status}`);
 }
+/** The user's Whisper server: the key and the recording go there and nowhere else ('' = none). */
+function sttUrl() { return String(settings.listen.sttUrl || process.env.LITELLM_BASE_URL || '').replace(/\/+$/, ''); }
+const useProviderStt = () => !!(process.env.LITELLM_API_KEY && sttUrl());
 async function transcribe(dataB64, type, filename) {
   if (typeof dataB64 !== 'string' || !dataB64) return { ok: false, error: 'Нет аудиоданных.' };
-  const baseUrl = (process.env.LITELLM_BASE_URL || 'https://litellm.sdvor.duckdns.org/v1').replace(/\/+$/, '');
+  const baseUrl = sttUrl();
   const apiKey = process.env.LITELLM_API_KEY || '';
   const buf = Buffer.from(dataB64, 'base64');
   if (buf.length < 1000) return { ok: false, error: 'Аудио слишком короткое.' };
+  if (!baseUrl) return /wav/.test(String(type || 'wav')) ? transcribeLocal(buf) : { ok: false, error: 'Укажите адрес сервера распознавания в настройках «Слушать».' };
   const mime = typeof type === 'string' && type ? type : 'audio/wav';
   const fd = new FormData();
   fd.append('model', 'groq/whisper-large-v3-turbo');
@@ -323,7 +329,8 @@ async function importVoice(body) {
   const name = String((body && body.name) || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
   if (!name || typeof body.data !== 'string') return { ok: false, error: 'Нужны имя и данные .bin.' };
   const buf = Buffer.from(body.data, 'base64');
-  if (buf.length < 1000) return { ok: false, error: 'Файл голоса пустой.' };
+  if (BUILTIN_VOICES.includes(name)) return { ok: false, error: 'Имя «' + name + '» занято встроенным голосом — переименуйте файл.' };
+  if (buf.length < 1024 * 64 || buf.length % 1024) return { ok: false, error: 'Это не стиль голоса Kokoro (.bin из строк по 256 чисел float32).' };
   const dir = kokoroVoicesDir();
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, name + '.bin'), buf);
@@ -334,9 +341,16 @@ async function importVoice(body) {
 }
 const pendingChat = [];                                         // recognised speech for the DSH composer: { text, send }
 const chatWaiters = new Set();                                  // long-polling /chat-message requests
+const STOP_TTL = 5000, PHRASE_TTL = 120000;                      // a late "стоп" must not cancel the next run
 function pushChat(m) {
-  pendingChat.push(m);
+  pendingChat.push({ at: Date.now(), ...m });
   for (const w of [...chatWaiters]) w();
+}
+function nextChat() {
+  for (;;) {
+    const m = pendingChat.shift();
+    if (!m || Date.now() - m.at < (m.stop ? STOP_TTL : PHRASE_TTL)) return m || null;
+  }
 }
 // ---------------------------------------------------------------- hands-free: "Алиса, …" goes to the agent
 // The renderer listens all the time (voice activity detection) and sends each phrase here. A phrase
@@ -348,7 +362,7 @@ function sttPython() {
   return runtimePython('stt');
 }
 async function sttState() {
-  try { const r = await fetch(`http://127.0.0.1:${STT_PORT}/health`, { signal: AbortSignal.timeout(800) }); const j = await r.json(); return j.ready ? 'ready' : 'loading'; } catch { return ''; }
+  try { const r = await fetch(`http://127.0.0.1:${STT_PORT}/health`, { signal: AbortSignal.timeout(800) }); const j = await r.json(); return j.ready ? 'ready' : j.error ? 'error' : 'loading'; } catch { return ''; }
 }
 async function sttEnsure(waitMs = 60000) {
   let st = await sttState();
@@ -360,7 +374,12 @@ async function sttEnsure(waitMs = 60000) {
     sttProcess.on('error', () => {});
   }
   const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) { if ((await sttState()) === 'ready') return true; await new Promise((r) => setTimeout(r, 400)); }
+  while (Date.now() < deadline) {
+    st = await sttState();
+    if (st === 'ready') return true;
+    if (st === 'error' || (!st && sttProcess && sttProcess.exitCode !== null)) return false;   // will not get better by waiting
+    await new Promise((r) => setTimeout(r, 400));
+  }
   return false;
 }
 const STT_HINT = 'Разговор с Алисой.';
@@ -372,29 +391,40 @@ async function transcribeLocal(buf) {
 }
 /** The DSH provider (LiteLLM Whisper) when its key is there, the local faster-whisper otherwise. */
 async function transcribeAny(buf) {
-  if (process.env.LITELLM_API_KEY) {
+  if (useProviderStt()) {
     try { const r = await transcribe(buf.toString('base64'), 'audio/wav', 'audio.wav'); if (r.ok) return { ...r, via: 'provider' }; } catch {}
   }
   return transcribeLocal(buf);
 }
 function wakeNames() {
-  const w = String(settings.listen.wake || 'алиса').toLowerCase().trim();
+  const w = String(settings.listen.wake || 'алиса').toLowerCase().trim().replace(/\s+/g, ' ');
   const extra = w === 'алиса' ? ['алис', 'alice', 'элис', 'олис'] : [];
-  return [w, ...extra].filter(Boolean);
+  return [w, ...extra].filter(Boolean).map((n) => n.split(' '));
+}
+const bare = (w) => w.toLowerCase().replace(/[^a-zа-яё]/gi, '');
+/** How many words her name takes at position i (0 = it is not there). Endings may differ: "Алису". */
+function nameAt(words, i) {
+  for (const n of wakeNames()) {
+    if (n.every((part, k) => { const w = bare(words[i + k] || ''); return w.length >= 3 && w.startsWith(part.slice(0, Math.max(4, part.length - 1))); })) return n.length;
+  }
+  return 0;
 }
 /** The phrase without her name, or null when she was not addressed. */
 function addressed(text) {
-  const t = String(text || '').trim();
-  const words = t.split(/\s+/);
-  const names = wakeNames();
+  const words = String(text || '').trim().split(/\s+/);
   for (let i = 0; i < words.length; i++) {
-    const w = words[i].toLowerCase().replace(/[^a-zа-яё]/gi, '');
-    if (w.length >= 3 && names.some((n) => w.startsWith(n.slice(0, Math.max(4, n.length - 1))))) {
-      words.splice(i, 1);
-      return words.join(' ').replace(/^[\s,.!?;:—-]+/, '').replace(/\s+([,.!?])/g, '$1').trim();
-    }
+    const k = nameAt(words, i);
+    if (!k) continue;
+    words.splice(i, k);
+    return words.join(' ').replace(/^[\s,.!?;:—-]+/, '').replace(/\s+([,.!?])/g, '$1').trim();
   }
   return null;
+}
+/** Exactly "<her name> стоп" and nothing else. Any other wording never stops anything. */
+function isStop(text) {
+  const words = String(text || '').trim().split(/\s+/).filter((w) => bare(w));
+  const k = words.length ? nameAt(words, 0) : 0;
+  return k > 0 && words.length === k + 1 && /^(стоп|stop)$/.test(bare(words[k]));
 }
 const PRIVATE_WINDOW = /пароль|password|bitwarden|1password|keepass|lastpass|банк|bank|сбер|тинькофф|tinkoff|альфа|vtb|втб|инкогнито|incognito|inprivate|private browsing|приватн/i;
 let lastWorld = null;
@@ -429,14 +459,11 @@ function startScreenNote() {
   if (earlyNote && Date.now() - earlyNote.at < 3000) return;
   earlyNote = { at: Date.now(), p: screenNote().catch(() => '') };
 }
-// "Алиса, стоп" — stops the agent's run and her voice. A bare "стоп" counts only as a whole phrase.
-const STOP_RE = /^(стоп|стой|хватит|остановись|остановить|прекрати|отмена|отмени|замолчи|молчи|тихо|stop)( (пожалуйста|всё|все|уже))?[.!…]*$/i;
-function isStop(text) { return STOP_RE.test(String(text || '').trim().replace(/[,]/g, '').replace(/\s+/g, ' ')); }
 /**
  * onlyStop: the phrase was heard while she was speaking (her own voice may be in it) — the only
  * thing taken from it is a stop command.
  */
-async function listenPhrase(buf, follow, onlyStop) {
+async function listenPhrase(buf, follow, onlyStop, session) {
   if (!buf || buf.length < 8000) return { ok: true, heard: '', sent: false };
   const notePromise = onlyStop || !settings.listen.screen ? Promise.resolve('')
     : earlyNote && Date.now() - earlyNote.at < 25000 ? earlyNote.p : screenNote().catch(() => '');
@@ -445,12 +472,12 @@ async function listenPhrase(buf, follow, onlyStop) {
   if (!r.ok) return { ok: false, error: r.error || 'не распознано' };
   const heard = r.text;
   if (!heard || heard.replace(/[^a-zа-яё]/gi, '').length < 2) return { ok: true, heard: '', sent: false };
-  const named = addressed(heard);
-  if (isStop(named !== null ? named : heard)) {
-    pushChat({ stop: true });
+  if (isStop(heard)) {
+    pushChat({ stop: true, session: session || '' });               // session: the one she is reading aloud
     return { ok: true, heard, stop: true, sent: false, via: r.via };
   }
   if (onlyStop) return { ok: true, heard, sent: false, via: r.via };
+  const named = addressed(heard);
   let phrase = named;
   if (phrase === null && follow) phrase = heard;
   if (phrase === null || phrase.replace(/[^a-zа-яё]/gi, '').length < 2) return { ok: true, heard, sent: false, named: phrase !== null, via: r.via };   // named: only "Алиса" — the next phrase is for her
@@ -760,6 +787,7 @@ function queryWorld() {
   });
 }
 let worldTimer = null;
+let winFaded = null;
 function startWorldLoop() {
   const tick = async () => {
     if (win && !win.isDestroyed() && !settings.hidden) {
@@ -768,11 +796,9 @@ function startWorldLoop() {
       if (d && win && !win.isDestroyed()) {
         const area = overlayArea();
         const windows = (d.windows || []).map((w) => ({ id: w.id, x: w.x - area.x, y: w.y - area.y, w: w.w, h: w.h, max: w.max, title: w.title }));
-        win.webContents.send('pet:world', { windows, fg: d.fg, full: !!d.full, idle: powerMonitor.getSystemIdleTime() });
-        if (settings.behaviors.hideFullscreen) {
-          const hide = !!d.full && !settings.portrait.auto && !windows.some((w) => w.id === d.fg && /amadeus/i.test(w.title));
-          win.setOpacity(hide ? 0 : 1);
-        } else win.setOpacity(1);
+        const faded = !!settings.behaviors.hideFullscreen && !!d.full && !settings.portrait.auto && !windows.some((w) => w.id === d.fg && /amadeus/i.test(w.title));
+        win.webContents.send('pet:world', { windows, fg: d.fg, full: !!d.full, faded, idle: powerMonitor.getSystemIdleTime() });
+        if (faded !== winFaded) { winFaded = faded; win.setOpacity(faded ? 0 : 1); }
       }
     }
     worldTimer = setTimeout(tick, 450);
@@ -891,9 +917,9 @@ function registerIpc() {
     catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   });
   ipcMain.on('voice:onset', () => startScreenNote());
-  ipcMain.handle('voice:listen', async (_e, wav, follow, onlyStop) => {
+  ipcMain.handle('voice:listen', async (_e, wav, follow, onlyStop, session) => {
     const buf = Buffer.isBuffer(wav) ? wav : wav instanceof ArrayBuffer ? Buffer.from(wav) : ArrayBuffer.isView(wav) ? Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength) : null;
-    try { return await listenPhrase(buf, !!follow, !!onlyStop); } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+    try { return await listenPhrase(buf, !!follow, !!onlyStop, typeof session === 'string' ? session : ''); } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   });
   ipcMain.handle('voice:turn', async (_e, wav) => {
     const buf = Buffer.isBuffer(wav) ? wav : wav instanceof ArrayBuffer ? Buffer.from(wav) : ArrayBuffer.isView(wav) ? Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength) : null;
@@ -917,7 +943,17 @@ function readBody(req) {
   });
 }
 
+// Only the plugin that started this process may drive it: it passes a random token in the environment.
+// Web pages cannot send the header (and any request with an Origin is refused), so they cannot reach
+// the routes that import files, feed phrases to the agent or change the recognition server.
+const TOKEN = process.env.AMADEUS_TOKEN || crypto.randomBytes(24).toString('hex');
+delete process.env.AMADEUS_TOKEN;                                // not inherited by the voice servers
+function allowed(req) {
+  const got = Buffer.from(String(req.headers['x-amadeus-token'] || '')), want = Buffer.from(TOKEN);
+  return !req.headers.origin && got.length === want.length && crypto.timingSafeEqual(got, want);
+}
 const server = http.createServer(async (req, res) => {
+  if (!allowed(req)) { req.resume(); return json(res, 403, { ok: false, error: 'forbidden' }); }
   const route = req.url.split('?')[0];
   const body = await readBody(req);
   try {
@@ -964,7 +1000,7 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, picked.canceled ? { ok: true, canceled: true, results: [] } : { ok: true, results: await importFiles(picked.filePaths) });
     } else if (req.method === 'POST' && route === '/animations/assign') {
       const file = path.basename(String(body.file || ''));
-      if (!fs.existsSync(path.join(ANIM_DIR, file))) throw new Error('Анимация не найдена.');
+      if (!file || /^\.+$/.test(file) || !fs.existsSync(path.join(ANIM_DIR, file))) throw new Error('Анимация не найдена.');
       const key = body.clip ? file + '#' + String(body.clip) : file;
       if (body.remove) {
         fs.rmSync(path.join(ANIM_DIR, file), { force: true });
@@ -979,7 +1015,8 @@ const server = http.createServer(async (req, res) => {
     } else if (req.method === 'GET' && route === '/chat-message') {
       // ?wait=ms: long poll — answers the moment a phrase is recognised instead of on the next poll
       const wait = clamp(Number(new URL(req.url, 'http://x').searchParams.get('wait')) || 0, 0, 20000);
-      if (!pendingChat.length && wait) {
+      let m = nextChat();
+      if (!m && wait) {
         await new Promise((resolve) => {
           const done = () => { clearTimeout(t); chatWaiters.delete(done); resolve(); };
           const t = setTimeout(done, wait);
@@ -987,11 +1024,15 @@ const server = http.createServer(async (req, res) => {
           res.on('close', done);
         });
         if (res.destroyed) return;                               // the poller is gone: keep the phrase for the next one
+        m = nextChat();
       }
-      const m = pendingChat.shift();
-      json(res, 200, { ok: true, text: m && m.text ? m.text : '', send: !!(m && m.send), stop: !!(m && m.stop) });
+      if (m) res.on('close', () => { if (!res.writableFinished) pendingChat.unshift(m); });   // not delivered after all
+      json(res, 200, { ok: true, text: m && m.text ? m.text : '', send: !!(m && m.send), stop: !!(m && m.stop), session: (m && m.session) || '', at: m ? m.at : 0 });
+    } else if (req.method === 'POST' && route === '/chat-requeue') {    // the plugin could not hand it to the page
+      if (body && (body.text || body.stop)) pendingChat.unshift({ at: Number(body.at) || Date.now(), text: String(body.text || ''), send: !!body.send, stop: !!body.stop, session: String(body.session || '') });
+      json(res, 200, { ok: true });
     } else if (req.method === 'POST' && route === '/listen-test') {   // debug: a phrase as if it came from the microphone
-      try { json(res, 200, await listenPhrase(Buffer.from(String(body.data || ''), 'base64'), !!body.follow)); }
+      try { json(res, 200, await listenPhrase(Buffer.from(String(body.data || ''), 'base64'), !!body.follow, !!body.onlyStop, String(body.session || ''))); }
       catch (e) { json(res, 200, { ok: false, error: String((e && e.message) || e) }); }
     } else if (req.method === 'POST' && route === '/provider') {
       if (typeof body.key === 'string' && body.key) process.env.LITELLM_API_KEY = body.key;
@@ -1028,7 +1069,7 @@ app.on('will-quit', () => { try { helper && helper.kill(); } catch {} try { if (
 app.whenReady().then(async () => {
   loadSettings();
   setTimeout(kokoroWarm, 4000);                                  // voice on: load Kokoro before the first answer
-  setTimeout(() => { if (settings.listen.enabled && !process.env.LITELLM_API_KEY) sttEnsure(1).catch(() => {}); }, 3000);   // listening on: load Whisper before the first phrase
+  setTimeout(() => { if (settings.listen.enabled && !useProviderStt()) sttEnsure(1).catch(() => {}); }, 3000);   // listening on: load Whisper before the first phrase
   protocol.handle(SCHEME, (req) => {
     try {
       const u = new URL(req.url);

@@ -4,6 +4,7 @@
 // emotions) and serves the live3D settings tab.
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, createReadStream, createWriteStream, mkdtempSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
@@ -24,13 +25,16 @@ let port = 0;
 let starting = null;
 let failedAt = 0;
 process.once('exit', () => { try { companion?.kill(); } catch {} });
+// The companion only listens to us: a random token in its environment, sent with every request.
+const TOKEN = randomBytes(24).toString('hex');
 
 function electronBinary() {
   // A standalone Electron from the shared runtime folder (setup/install-runtime.ps1 puts it there):
   // the DSH binary itself cannot be used — its single-instance lock makes it exit at once.
   const runtime = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
   const cand = process.env.AMADEUS_COMPANION_ELECTRON || path.join(runtime, 'electron', 'electron.exe');
-  return (cand && existsSync(cand)) ? cand : process.execPath;
+  if (!existsSync(cand)) throw new Error('Не найден Electron (' + cand + '). Установите runtime: amadeus-live3d\\setup\\install-runtime.ps1');
+  return cand;
 }
 
 function ensureCompanion() {
@@ -38,7 +42,7 @@ function ensureCompanion() {
   if (starting) return starting;
   if (Date.now() - failedAt < 10000) return Promise.reject(new Error('3D-компаньон недоступен, повторю попытку чуть позже.'));
   starting = new Promise((resolve, reject) => {
-    const env = { ...process.env, AMADEUS_PARENT_PID: String(process.pid) };
+    const env = { ...process.env, AMADEUS_PARENT_PID: String(process.pid), AMADEUS_TOKEN: TOKEN };
     if (providerKey && !env.LITELLM_API_KEY) env.LITELLM_API_KEY = providerKey;
     delete env.ELECTRON_RUN_AS_NODE;
     const child = spawn(electronBinary(), [COMPANION_DIR], { stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true });
@@ -55,18 +59,19 @@ function ensureCompanion() {
     child.stderr.resume();
     child.on('error', fail);
     child.on('exit', () => { if (companion === child) { companion = null; port = 0; } });
-  }).finally(() => { starting = null; });
+  }).catch((e) => { failedAt = Date.now(); throw e; }).finally(() => { starting = null; });
   return starting;
 }
 
-async function http(route, body, timeoutMs = 30000) {
+async function http(route, body, timeoutMs = 30000, signal = null) {
   await ensureCompanion();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
+  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', () => ac.abort(), { once: true }); }
   try {
     const res = await fetch(`http://127.0.0.1:${port}${route}`, {
       method: body === undefined ? 'GET' : 'POST',
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      headers: { 'x-amadeus-token': TOKEN, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ac.signal,
     });
@@ -89,12 +94,17 @@ function savedActiveModel() {
 
 // ---------------------------------------------------------------- agent speech bridge
 // Same stream as amadeus-live2d: phases (connecting/thinking/tool/answer) + streamed text.
-// Sessions whose agent is running now: "Алиса, стоп" cancels them (the DSH client does the cancel).
+// Sessions whose agent is running now: "Алиса, стоп" cancels one of them (the DSH client does the cancel).
 const runningSessions = new Map();                       // session id -> last activity (ms)
-function liveSessions() {
+/** What "Алиса, стоп" cancels: the session she is reading aloud; otherwise her own chat, else the latest active one. */
+function stopTargets(voiced) {
   const now = Date.now();
   for (const [id, at] of runningSessions) if (now - at > 30 * 60 * 1000) runningSessions.delete(id);
-  return [...runningSessions.keys()].filter((id) => id && id !== 'default');
+  if (voiced) return runningSessions.has(voiced) ? [voiced] : [];       // its answer is complete: only her voice stops
+  const own = Object.values(readChat().sessions || {}).filter((id) => runningSessions.has(id));
+  if (own.length) return own.slice(0, 1);
+  const latest = [...runningSessions].sort((a, b) => b[1] - a[1])[0];
+  return latest ? [latest[0]] : [];
 }
 function trackAgentSpeech(ctx) {
   if (typeof ctx.on !== 'function') return;
@@ -103,15 +113,27 @@ function trackAgentSpeech(ctx) {
   const forAgent = (agent) => {
     const id = (agent && agent.session && agent.session.id) || (agent && agent.id) || 'default';
     let t = trackers.get(id);
-    if (!t) { t = { speech: '', phase: 'idle', status: '', lastAt: 0 }; trackers.set(id, t); }
+    if (!t) { t = { id, speech: '', phase: 'idle', status: '', lastAt: 0, fresh: true, out: [], sending: false }; trackers.set(id, t); }
     return t;
   };
-  const send = (t, final, force) => {
+  const send = (t, final, force, extra) => {
     if (!companion || !port) return;            // only when the 3D companion is running
     const now = Date.now();
     if (!force && !final && now - t.lastAt < 200) return;
     t.lastAt = now;
-    http('/speak', { text: t.speech, final, phase: t.phase, status: t.status }, 5000).catch(() => {});
+    post(t, { session: t.id, text: t.speech, final, phase: t.phase, status: t.status, ...extra });
+  };
+  // One message at a time per session: the end of an answer must never overtake its text. While one is
+  // on its way, newer text replaces the unsent older one.
+  const post = (t, m) => {
+    const last = t.out[t.out.length - 1];
+    if (last && last.phase === 'answer' && !last.final && m.phase === 'answer') t.out[t.out.length - 1] = m; else t.out.push(m);
+    if (!t.sending) pump(t);
+  };
+  const pump = async (t) => {
+    t.sending = true;
+    while (t.out.length) { try { await http('/speak', t.out.shift(), 5000); } catch {} }
+    t.sending = false;
   };
   const setPhase = (t, phase, status, final) => {
     if (t.phase === phase && t.status === status) return;
@@ -124,7 +146,14 @@ function trackAgentSpeech(ctx) {
     const t = forAgent(payload && payload.agent);
     const sid = sessionOf(payload && payload.agent);
     if (sid) runningSessions.set(sid, Date.now());
-    if (frame.type === 'start') { t.speech = ''; setPhase(t, 'connecting', 'Подключаюсь…', false); return; }
+    if (frame.type === 'start') {
+      t.speech = '';
+      if (t.fresh) {                                     // the first step of a new turn: the previous answer is not read any further
+        t.fresh = false; t.phase = 'connecting'; t.status = 'Подключаюсь…';
+        send(t, false, true, { turn: true });
+      } else setPhase(t, 'connecting', 'Подключаюсь…', false);
+      return;
+    }
     if (frame.type === 'end') return;
     const chunk = frame.chunk;
     if (!chunk) return;
@@ -148,9 +177,11 @@ function trackAgentSpeech(ctx) {
     if (sid) { if (payload.status === 'idle') runningSessions.delete(sid); else runningSessions.set(sid, Date.now()); }
     if (payload.status !== 'idle') return;
     const t = forAgent(payload.agent);
-    t.speech = '';
-    if (t.phase === 'answer' || t.phase === 'error') { t.phase = 'idle'; t.status = ''; return; }
-    setPhase(t, 'idle', '', true);
+    t.speech = ''; t.fresh = true;
+    if (t.phase === 'answer' || t.phase === 'error') { t.phase = 'idle'; t.status = ''; }
+    else setPhase(t, 'idle', '', true);
+    if (companion && port) post(t, { session: t.id, phase: 'end', text: '', final: true });   // the turn is over (or was cancelled)
+    if (trackers.size > 50) for (const [id, x] of trackers) if (x !== t && x.fresh) { trackers.delete(id); break; }
   });
   ctx.on('agent/error', (payload) => {
     const t = forAgent(payload && payload.agent);
@@ -285,8 +316,8 @@ function apply(ctx) {
   if (savedActiveModel()) ensureCompanion().catch(() => {});
   watchProviderKey(ctx);
   trackAgentSpeech(ctx);
-  setInterval(refreshCatalog, 60000);
-  setTimeout(refreshCatalog, 8000);
+  const timers = [setInterval(refreshCatalog, 60000), setTimeout(refreshCatalog, 8000)];
+  if (typeof ctx.on === 'function') ctx.on('dispose', () => { for (const x of timers) clearTimeout(x); });
   if (typeof ctx.on === 'function') {
     ctx.on('system-prompt/assemble', async (assembly, _hostCtx, next) => {
       try {
@@ -416,11 +447,15 @@ function apply(ctx) {
   ctx.inject(['webServer'], (hostCtx) => {
     const webServer = hostCtx.webServer;
     if (!webServer || typeof webServer.register !== 'function') return;
+    // Another site open in the browser must not reach these routes: its requests are marked cross-site,
+    // and it cannot send JSON without a preflight that nobody answers.
+    const foreign = (req) => String(req.headers['sec-fetch-site'] || '') === 'cross-site';
     const route = (p, method, handler) => webServer.register({
       kind: 'exact', path: p,
       handler: async (req, res) => {
         if (method !== 'ANY' && req.method !== method) { res.writeHead(405, { allow: method }); res.end(); return; }
-        try { sendJson(res, 200, await handler(req.method === 'POST' ? await readJson(req) : null, req)); }
+        if (foreign(req) || (req.method === 'POST' && !/^application\/json\b/i.test(String(req.headers['content-type'] || '')))) { req.resume(); sendJson(res, 403, { ok: false, error: 'forbidden' }); return; }
+        try { const out = await handler(req.method === 'POST' ? await readJson(req) : null, req, res); if (!res.destroyed) sendJson(res, 200, out); }
         catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
       },
     });
@@ -459,19 +494,25 @@ function apply(ctx) {
       return { ok: true, path: companionChatDir(), workspaceId: st.workspaceId || '', sessions: st.sessions || {}, model };
     });
     // long poll: the companion answers as soon as a phrase is recognised (or empty after ~15 s)
-    route('/amadeus-live3d/chat-message', 'GET', async (_b, req) => {
+    route('/amadeus-live3d/chat-message', 'GET', async (_b, req, res) => {
       const wait = /[?&]wait=1/.test(String(req && req.url || '')) ? 15000 : 0;
       if (!port) { if (wait) await new Promise((r) => setTimeout(r, 1500)); return { ok: true, text: '' }; }
-      const r = await http('/chat-message' + (wait ? '?wait=' + wait : ''), undefined, wait + 5000).catch(() => ({ ok: true, text: '' }));
-      if (r && r.stop) r.sessions = liveSessions();                 // "Алиса, стоп": what to cancel
+      // the page was closed or reloaded: stop waiting, or the next phrase would go to nobody
+      const gone = new AbortController();
+      res.on('close', () => { if (!res.writableEnded) gone.abort(); });
+      const r = await http('/chat-message' + (wait ? '?wait=' + wait : ''), undefined, wait + 5000, gone.signal).catch(() => ({ ok: true, text: '' }));
+      if (res.destroyed && (r.text || r.stop)) { http('/chat-requeue', r, 5000).catch(() => {}); return r; }
+      if (r && r.stop) r.sessions = stopTargets(r.session);          // "Алиса, стоп": what to cancel
       return r;
     });
     route('/amadeus-live3d/transcribe', 'POST', (b) => http('/transcribe', b, 90000));
     route('/amadeus-live3d/voice-import', 'POST', (b) => http('/voice-import', b, 60000));
-    route('/amadeus-live3d/voices', 'GET', () => http('/voices'));    webServer.register({
+    route('/amadeus-live3d/voices', 'GET', () => http('/voices'));
+    webServer.register({
       kind: 'exact', path: '/amadeus-live3d/import-upload',
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        if (foreign(req)) { req.resume(); sendJson(res, 403, { ok: false, error: 'forbidden' }); return; }
         const n = path.basename(String(new URL(req.url, 'http://x').searchParams.get('name') || ''));
         if (!/\.(vrm|vrma|vmd|fbx|glb|unitypackage|anim|zip|rar|7z)$/i.test(n)) { req.resume(); sendJson(res, 200, { ok: false, error: 'Перетащите .vrm (модель), анимацию .vrma / .vmd / .fbx или архив с ними.' }); return; }
         const dir = mkdtempSync(path.join(tmpdir(), 'amadeus3d-upload-'));
@@ -494,7 +535,7 @@ function apply(ctx) {
       handler: (req, res) => {
         const id = decodeURIComponent(new URL(req.url, 'http://x').pathname).replace(/^\/amadeus-live3d\/preview\/?/, '');
         const file = path.join(MODELS_DIR, id, 'preview.png');
-        if (!/^[A-Za-z0-9._-]+$/.test(id) || !existsSync(file)) { res.writeHead(404); res.end(); return; }
+        if (!/^(?!\.+$)[A-Za-z0-9._-]+$/.test(id) || !existsSync(file)) { res.writeHead(404); res.end(); return; }
         res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' });
         createReadStream(file).pipe(res);
       },

@@ -145,15 +145,20 @@ git -C W:\plugins-dsh pull
 
 ## Голос и микрофон (live3D)
 
-- **Озвучка ответов** по предложениям, пока агент ещё пишет. Движки (все бесплатные):
+- **Озвучка ответов** по предложениям, пока агент ещё пишет; новый вопрос прерывает старый ответ.
+  Движки (бесплатные; модели Silero — [только для некоммерческого использования](https://github.com/snakers4/silero-models/blob/master/LICENSE), CC BY-NC):
   **Silero** (локально, по умолчанию; голоса Ксения, Бая, Айдар, Евгений), **Edge** (онлайн,
   нейроголоса Microsoft), **Kokoro** (локально). Код, JSON и таблицы вслух не читаются; числа,
   годы, проценты и английские слова — читаются словами.
 - **«Алиса, …»** — фраза с именем персонажа уходит агенту (кнопка микрофона на круге в режиме
   пузыря или настройка «Слушать»). Имя меняется в настройках.
-- **«Алиса, стоп»** (или «хватит», «замолчи») — она замолкает и прерывает работу агента, в том
-  числе посреди своей речи.
-- Распознавание речи — через Whisper провайдера, если в DSH есть ключ LiteLLM, иначе локально.
+- **«Алиса, стоп»** — ровно эта фраза (имя и «стоп») заставляет её замолчать и прерывает работу
+  агента, в том числе посреди её речи. Другие слова («хватит», «тихо», «стоп» без имени) ничего не
+  останавливают. Отменяется чат, который она читает; если она молчит — её собственный чат или
+  последний работающий.
+- **Распознавание речи** — локально (Whisper small). Быстрее на своём OpenAI-совместимом сервере:
+  настройки → «Слушать» → «Свой сервер распознавания»; туда уходят запись голоса и ключ
+  `LITELLM_API_KEY` из DSH. Без адреса ничего никуда не отправляется.
 
 ## Частые проблемы
 
@@ -203,8 +208,58 @@ git -C W:\plugins-dsh pull
 См. [`amadeus-providers/README.md`](amadeus-providers/README.md) и
 [`amadeus-harness/README.md`](amadeus-harness/README.md).
 
+## Источники моделей и анимаций
+
+Сами модели и анимации в репозиторий **не входят** (они защищены авторским правом; папки `models/` и
+`animations/` в `.gitignore`). Ниже: что использовалось при разработке и откуда оно взято. Где источник
+в файлах не записан, так и сказано. Условия использования смотрите на странице источника.
+
+**Live2D-модели** (импортированы из архивов через «Добавить модель»)
+
+| Модель | Автор / источник |
+|---|---|
+| Komi | <https://shiranui-bzw-live2d.carrd.co/> (страница из READ_ME модели; модель для VTube Studio) |
+| Фрирен | архив `Frieren.zip`; скорее всего оттуда же, откуда остальные (см. ниже) |
+| March 7th, Kamiya Hakuko, TUBASA 014, 白发天使, 11月椿, 八千代辉夜姬, 长离, 云汐 | бесплатные модели с BOOTH, ссылки в архивах нет |
+
+Основной источник бесплатных Live2D-моделей (а также 3D-моделей и анимаций): BOOTH, поиск <https://booth.pm/en/search/free%20live2d>.
+
+Среда отрисовки Live2D — **Live2D Cubism Core** (`live2dcubismcore.min.js`, проприетарная, по лицензии
+Live2D Inc.) и открытые обёртки вокруг неё.
+
+**3D-модели**
+
+| Модель | Автор / источник |
+|---|---|
+| Captain (`.vrm`, VRM 1.0) | VRoid Hub: <https://hub.vroid.com/en/characters/5372173277651989086/models/6729427563433839515>; лицензия из метаданных: только автор, личное некоммерческое использование, без перераспространения |
+
+**3D-анимации** (лежат в `amadeus-live3d/companion/animations/`)
+
+| Файлы | Откуда |
+|---|---|
+| `VRMA_01` … `VRMA_06` (`.vrma`) | «VRMアニメーション7種セット» (VRoid Project), бесплатно: <https://vroid.booth.pm/items/5512385>; описание формата: <https://vrm.dev/en/vrma/> |
+| `Idle_*_MIXAMO_*.fbx` (разговор, оглядывание, музыка и т.п.) | Mixamo (Adobe): <https://www.mixamo.com> (нужен бесплатный аккаунт Adobe; скачивать как FBX); `Jump`, `Walking`, `Falling_*`, `Idle_Bored` лежат рядом, источник у них не записан |
+| `UAL1_Standard.glb` | Universal Animation Library (Standard, CC0): <https://quaternius.itch.io/universal-animation-library>, страница пака: <https://quaternius.com/packs/universalanimationlibrary.html> |
+| `Rig_Medium_General / MovementBasic / Simulation.glb` | KayKit Character Animations (CC0): <https://kaylousberg.itch.io/kaykit-character-animations> (набор Rig_Medium; точные имена файлов в пакете не проверены) |
+| `foxsay`, `jikan`, `neko`, `shakeit`, `tokino`, `test_motion` (`.vmd`) | танцы в формате MMD, ссылка не записана |
+| `Mew_Pose_Ver.0 - St*.uanim.json` | позы из Unity (`.anim`), конвертированные в json; ссылка не записана |
+
+Ссылки на Quaternius, KayKit и VRoid Project подобраны по именам файлов и проверены поиском; лицензию
+смотрите в самом скачанном пакете. Где ссылки нет, источник в файлах не записан.
+
+**Где искать дальше (каталоги, откуда можно пополнять свои папки):**
+
+- Live2D: <https://booth.pm> (поиск «Live2D モデル»), <https://nizima.com>; модели для VTube Studio — на страницах, откуда их скачивают.
+- VRM-модели: <https://hub.vroid.com> (VRoid Hub, условия у каждой модели свои), <https://booth.pm> (поиск «VRM»).
+- Анимации: <https://www.mixamo.com>, <https://quaternius.com/packs.html>, <https://kaylousberg.itch.io>, образцы `.vrma` на BOOTH выше.
+
+**Библиотеки внутри плагинов:** three.js (MIT), @pixiv/three-vrm и three-vrm-animation (MIT, pixiv Inc.,
+текст лицензии в `amadeus-live3d/companion/renderer/vendor/three-vrm.LICENSE`).
+
 ## Для разработчиков
 
+- Тесты live3D: `node --test amadeus-live3d/test/voice.test.mjs` и
+  `python -m unittest discover amadeus-live3d/test`.
 - `build-clients.cjs` пересобирает `lib/client.js` live2D / live3D из исходников amadeus-v2 —
   нужен только тому, у кого есть его исходники; плагинам для работы не нужен.
 - `amadeus-live2d/_test.cjs` — проверка live2D без DSH (путь к Electron внутри — поправьте под
