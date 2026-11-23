@@ -502,7 +502,7 @@ window.__ModuleLoader__.load({
       var sw = function (key, label, hint) { var own = key === "walk" || key === "climb" || key === "sleep"; return auiRow(key, label, hint, auiSwitch(b[key] !== false, function () { var p = {}; p[key] = b[key] === false; patch({ behaviors: p }); }), cfg.hidden || (own && !selfLife)); };
       return jsx("div", { className: "aui-stack", children: [
         auiCard("screen", "На экране", null, [
-          auiRow("shown", "Показывать персонажа", "Живёт поверх окон в нижней части экрана.", auiSwitch(!cfg.hidden, function () { patch({ hidden: !cfg.hidden }); })),
+          auiRow("shown", "Показывать персонажа", "Живёт поверх окон в нижней части экрана. Выключите — модель, микрофон и голос полностью выгрузятся из памяти.", auiSwitch(!cfg.hidden, function () { patch({ hidden: !cfg.hidden }); })),
           auiRow("portrait", "Режим пузыря", "Голова и плечи в круглом окошке в углу экрана — как «watch & play» в Kyndred. Кольцо можно перетаскивать, колесо мыши над ним меняет размер.", auiSwitch(!!(cfg.portrait || {}).enabled, function () { patch({ portrait: { enabled: !(cfg.portrait || {}).enabled } }); }), cfg.hidden),
           auiRow("portrait-size", "Размер пузыря", null, auiRange((cfg.portrait || {}).size || 220, 120, 520, 10, " px", function (v) { patch({ portrait: { size: v } }); }), cfg.hidden),
           auiRow("portrait-auto", "Пузырь в полноэкранных играх", "Вместо того чтобы прятаться, персонаж уменьшается в пузырь в углу, пока открыта игра или видео на весь экран.", auiSwitch((cfg.portrait || {}).auto !== false, function () { patch({ portrait: { auto: (cfg.portrait || {}).auto === false } }); }), cfg.hidden || (cfg.behaviors || {}).hideFullscreen === false),

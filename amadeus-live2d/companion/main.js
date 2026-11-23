@@ -12,7 +12,7 @@
 // Every request carries the token of the plugin that started us (AMADEUS_TOKEN), see allowed().
 'use strict';
 
-const { app, BrowserWindow, ipcMain, protocol, screen, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, screen, dialog, nativeImage } = require('electron');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
@@ -21,6 +21,7 @@ const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
 const importer = require('./importer');
 const { Speech } = require('./speech-text');
+const { PropStore, EVENTS } = require('./props');
 
 const RENDERER_DIR = path.join(__dirname, 'renderer');
 const MODELS_DIR = path.join(__dirname, 'models');
@@ -252,6 +253,7 @@ async function edgeEnsure() {
 }
 function stopServers() {
   for (const p of [kokoroProcess, edgeProcess, sttProcess]) { try { if (p && p.exitCode === null) p.kill(); } catch {} }
+  kokoroProcess = edgeProcess = sttProcess = null;               // a killed process keeps exitCode null: forget it, or it would never start again
 }
 app.on('will-quit', () => { stopServers(); gpuLoading(false); });
 async function edgeSynthesize(text) {
@@ -305,11 +307,107 @@ async function synthesize(text) {
     return { ok: false, text, error: voiceError.error };
   }
 }
+/** Hidden = off: the windows with the model, the textures and the voice servers are gone from memory. */
+let lastBounds = null;                                           // where she stood
+function switchOff() {
+  quiet();
+  gpuLoading(false);
+  if (character && !character.isDestroyed()) lastBounds = figureBounds();
+  for (const w of [character, bubble, menu]) if (w && !w.isDestroyed()) w.destroy();
+  character = bubble = menu = null;
+  recording = false; adjusting = ''; front = null; lastBubblePhase = ''; room = { x: 0, top: 0 };
+  for (const [id, p] of pending) { clearTimeout(p.t); pending.delete(id); p.resolve({ ok: false, error: OFF_TEXT }); }
+  stopServers();
+}
+function switchOn() {
+  if (character && !character.isDestroyed()) return;
+  createCharacterWindow();
+  createBubbleWindow();
+  createMenuWindow();
+  restoreActiveModel();
+}
+const OFF_TEXT = 'Персонаж выключен: включите «Показывать персонажа» в настройках live2D.';
 /** Everything that is on screen or being said goes away with the character. */
 function quiet() {
   speech.hush();
+  if (adjusting) { adjusting = ''; sendCommand({ name: 'adjust_prop', args: { id: '' } }); }
   if (bubble && !bubble.isDestroyed()) bubble.hide();
   if (menu && !menu.isDestroyed()) menu.hide();
+}
+// ---- accessories and gestures (props.js keeps them, renderer/props.mjs draws them)
+/** PNG / JPEG pixels for the import: their size, and a crop not larger than maxSide. */
+function decodeImage(buf) {
+  const image = nativeImage.createFromBuffer(buf);
+  if (image.isEmpty()) return null;
+  const { width: w, height: h } = image.getSize();
+  return {
+    w, h, data: image.toBitmap(),
+    crop(box, maxSide) {
+      let part = image.crop(box);
+      const k = maxSide / Math.max(box.width, box.height);
+      if (k < 1) part = part.resize({ width: Math.max(1, Math.round(box.width * k)), height: Math.max(1, Math.round(box.height * k)), quality: 'best' });
+      const size = part.getSize();
+      return { buf: part.toPNG(), w: size.width, h: size.height };
+    },
+  };
+}
+const props = new PropStore(path.join(__dirname, 'props'), { decode: decodeImage, extract: importer.extractAll, walk: importer.walkFiles });
+function propsView() {
+  const view = props.view(activeModelId);
+  for (const p of view.items) {
+    p.images = p.images.map((im, i) => ({ ...im, url: `${SCHEME}://_props/${p.id}/${i}` }));
+    const file = p.model && props.modelFile(p.id);
+    if (file) p.modelUrl = pathToFileURL(file).toString();
+  }
+  return view;
+}
+/** A gesture for something that happened (only when one is assigned and she is on screen). */
+function gestureEvent(name) {
+  if (hidden || !activeModelId || !props.state.events[name]) return;
+  sendCommand({ name: 'gesture', args: { event: name } });
+}
+let adjusting = '';
+async function propsDo(b) {
+  const id = String(b.id || ''), model = activeModelId;
+  const needModel = () => { if (!model) throw new Error('Сначала выберите персонажа.'); };
+  let extra = {};
+  switch (b.op) {
+    case 'list': break;
+    case 'import': extra = await props.import((Array.isArray(b.paths) ? b.paths : []).filter((p) => typeof p === 'string' && p)); break;
+    case 'import_dialog': {
+      const picked = await dialog.showOpenDialog({ title: 'Картинки или архив с ассетом', defaultPath: app.getPath('downloads'), properties: ['openFile', 'multiSelections'], filters: [{ name: 'Картинки и архивы', extensions: ['png', 'webp', 'gif', 'jpg', 'jpeg', 'zip', 'rar', '7z'] }] });
+      extra = picked.canceled ? { canceled: true, added: [], problems: [] } : await props.import(picked.filePaths);
+      break;
+    }
+    case 'update': props.update(id, b); break;
+    case 'wear': needModel(); props.wear(model, id, b.on); break;
+    case 'place': needModel(); props.place(model, id, b.place); break;
+    case 'reset': needModel(); props.reset(model, id); break;
+    case 'share': needModel(); props.share(model, id); break;
+    case 'event': props.event(String(b.event || ''), id); break;
+    case 'seconds': props.state.seconds = Math.min(10, Math.max(1, Number(b.seconds) || 3)); props.save(); break;
+    case 'remove': props.remove(id); break;
+    case 'show': {
+      needModel();
+      if (hidden) throw new Error('Персонаж скрыт.');
+      const p = props.byName(b.id || b.name);
+      if (!p) throw new Error('Такого жеста нет.');
+      const r = await commandResult({ name: 'gesture', args: { id: p.id, seconds: Number(b.seconds) || 0 } }, 8000);
+      if (!r.ok) throw new Error(r.error || 'Жест не показан.');
+      break;
+    }
+    case 'adjust': {
+      needModel();
+      if (hidden && b.on) throw new Error('Персонаж скрыт: покажите его, чтобы двигать предмет.');
+      const r = await commandResult({ name: 'adjust_prop', args: { id: b.on ? id : '' } }, 8000);
+      if (!r.ok) throw new Error(r.error || 'Персонаж не готов.');
+      adjusting = r.adjusting || '';
+      break;
+    }
+    default: throw new Error('Неизвестная операция.');
+  }
+  if (!['list', 'show', 'adjust'].includes(b.op)) toCharacter('link:settings', settings());
+  return { ok: true, ...extra, ...props.view(model), model, adjusting, eventNames: EVENTS };
 }
 function settings() {
   const models = {};
@@ -320,6 +418,8 @@ function settings() {
     modelScale,
     voiceReplies: { ...voiceReplies },
     catalogState: { models },
+    props: propsView(),
+    propsFor: activeModelId,
     speechBubble: { ...speechBubble },
     behaviors: { ...behaviors },
     hotkeys: { ...hotkeys },
@@ -338,10 +438,8 @@ function applySettingsPatch(patch) {
   let changed = false;
   if (typeof patch.hidden === 'boolean' && patch.hidden !== hidden) {
     hidden = patch.hidden;
-    if (character && !character.isDestroyed()) {
-      if (hidden) { character.hide(); quiet(); }
-      else if (!character.isVisible()) character.showInactive();
-    }
+    if (hidden) switchOff();
+    else switchOn();
     changed = true;
   }
   if (patch.behaviors && typeof patch.behaviors === 'object') {
@@ -588,7 +686,7 @@ function runImport(paths) {
     const results = await importer.importPaths(paths, MODELS_DIR);
     const ids = results.flatMap((r) => r.imported.map((m) => m.id));
     if (ids.length) toCharacter('link:settings', settings());
-    if (ids.length && (await waitReady(20000))) {
+    if (ids.length && !hidden && (await waitReady(20000))) {
       for (const r of results) {
         for (const m of r.imported) {
           if (hasPreview(m.id)) { m.preview = true; continue; }
@@ -634,7 +732,7 @@ function renameLabels(body) {
 }
 
 function sendCommand(command) {
-  if (!character || character.webContents.isLoading()) { dlog('sendCommand: null (isLoading=' + Boolean(character && character.webContents.isLoading()) + ')'); return null; }
+  if (!character || character.isDestroyed() || character.webContents.isLoading()) { dlog('sendCommand: null (isLoading=' + Boolean(character && !character.isDestroyed()) + ')'); return null; }
   const id = randomUUID();
   character.webContents.send('link:command', id, { modelId: activeModelId, ...command });
   return id;
@@ -642,7 +740,7 @@ function sendCommand(command) {
 
 function commandResult(command, timeoutMs = 10000) {
   const id = sendCommand(command);
-  if (id === null) return Promise.resolve({ ok: false, error: 'Окно персонажа не готово.' });
+  if (id === null) return Promise.resolve({ ok: false, error: hidden ? OFF_TEXT : 'Окно персонажа не готово.' });
   return new Promise((resolve) => {
     const t = setTimeout(() => { pending.delete(id); process.stderr.write('cmd timeout ' + command.name + '\n'); dlog('cmd timeout ' + command.name); resolve({ ok: false, error: 'Окно персонажа не ответило вовремя.' }); }, timeoutMs);
     pending.set(id, { resolve, t });
@@ -654,7 +752,7 @@ function waitReady(timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
     const poll = async () => {
       try {
-        if (!character || character.webContents.isDestroyed()) return resolve(false);
+        if (!character || character.isDestroyed()) return resolve(false);
         const ready = await character.webContents.executeJavaScript("!!(window.amadeus && typeof window.amadeus.answer === 'function')", true);
         if (ready === true) return resolve(true);
       } catch { /* page still loading */ }
@@ -670,17 +768,19 @@ async function loadModel(id) {
   if (!fs.existsSync(path.join(MODELS_DIR, id, 'character.json'))) throw new Error(`Модель "${id}" не найдена.`);
   const previous = activeModelId;
   activeModelId = id;
+  if (hidden) { persist(); return { ok: true, id }; }            // off: she appears with it when switched on
   gpuLoading(true);
   toCharacter('link:settings', settings());
   const deadline = Date.now() + 30000;
   let error = 'Модель не загрузилась за отведённое время.';
-  while (Date.now() < deadline && activeModelId === id) {
+  while (Date.now() < deadline && activeModelId === id && !hidden) {
     const result = await commandResult({ name: 'sync_character', args: {} }, 5000);   // answers once the model is loaded, or why it is not
     if (result && result.ok) { gpuLoading(false, true); persist(); return { ok: true, id }; }
     if (result && result.failed) { error = result.error || error; break; }
     await new Promise((res) => setTimeout(res, 200));
   }
   if (activeModelId !== id) return { ok: false, error: 'Выбрана другая модель.' };
+  if (hidden) { gpuLoading(false); persist(); return { ok: true, id }; }   // switched off meanwhile: not a failure
   if (!(await rendererAlive())) gpuFailed('the window froze while loading a model');
   gpuLoading(false);
   if (previous !== id) { activeModelId = previous; toCharacter('link:settings', settings()); }   // the character that was there comes back
@@ -713,10 +813,16 @@ function bubbleStyle() {
   };
 }
 
+// The character window is larger than the figure's box when accessories need room around it.
+let room = { x: 0, top: 0 };
+function figureBounds() {
+  const b = character.getBounds();
+  return { x: b.x + room.x, y: b.y + room.top, width: Math.max(1, b.width - room.x * 2), height: Math.max(1, b.height - room.top) };
+}
 function placeBubble() {
   if (!character || !bubble || character.isDestroyed() || bubble.isDestroyed()) return;
   const size = bubbleSize();
-  const bounds = character.getBounds();
+  const bounds = figureBounds();
   const work = screen.getDisplayMatching(bounds).workArea;
   const overlap = Math.round(bounds.width * LIVE2D_BUBBLE_OVERLAP);
   const top = Math.max(work.y + 8, bounds.y + Math.round(bounds.height * 0.05));
@@ -730,7 +836,7 @@ function placeBubble() {
 /** Anchor the right-click quick menu to the character (near the right-click point). */
 function placeMenu() {
   if (!menu || !character || character.isDestroyed() || menu.isDestroyed()) return;
-  const bounds = character.getBounds();
+  const bounds = figureBounds();
   const work = screen.getDisplayMatching(bounds).workArea;
   const [w, h] = menu.getSize();
   let px, py;
@@ -749,9 +855,9 @@ function placeMenu() {
 
 let recording = false;                                           // the character window is listening to the microphone
 function showMenu(x, y) {
-  if (!menu) return;
+  if (!menu || menu.isDestroyed()) return;
   if (character && !character.isDestroyed()) {
-    const bounds = character.getBounds();
+    const bounds = figureBounds();
     const cursor = { x: Math.round(Number(x) || 0), y: Math.round(Number(y) || 0) };
     const [w, h] = menu.getSize();
     menuOffset = { dx: cursor.x - w - 12 - bounds.x, dy: cursor.y - Math.round(h / 2) - bounds.y };
@@ -763,10 +869,11 @@ function showMenu(x, y) {
 }
 
 function createCharacterWindow() {
+  hadWindows = true;
   const work = screen.getPrimaryDisplay().workArea;
-  character = new BrowserWindow({
-    width: 360, height: 560,
-    x: work.x + work.width - 400, y: work.y + work.height - 560,
+  const spot = lastBounds || { x: work.x + work.width - 400, y: work.y + work.height - 560, width: 360, height: 560 };
+  const made = character = new BrowserWindow({
+    width: spot.width, height: spot.height, x: spot.x, y: spot.y,
     transparent: true, frame: false, resizable: false, hasShadow: false,
     alwaysOnTop: true, skipTaskbar: true, focusable: false, show: false,
     backgroundColor: '#00000000',
@@ -774,14 +881,14 @@ function createCharacterWindow() {
   });
   character.setIgnoreMouseEvents(true, { forward: true });
   character.loadFile(path.join(RENDERER_DIR, 'index.html'));
-  character.once('ready-to-show', () => { if (!character.isDestroyed() && !hidden) character.showInactive(); });
+  character.once('ready-to-show', () => { if (!made.isDestroyed() && !hidden) made.showInactive(); });
   character.webContents.on('console-message', (event) => {
     process.stderr.write(`[live2d:${event.level}] ${event.message}\n`);
     dlog('renderer: [' + event.level + '] ' + event.message);
   });
   // A crashed window, or one whose WebGL context the driver took away, is loaded again (3 times in
   // 5 minutes: the GPU is not to be trusted here).
-  character.webContents.on('render-process-gone', (_event, d) => { if (d.reason !== 'clean-exit') reviveCharacter('renderer ' + d.reason); });
+  character.webContents.on('render-process-gone', (_event, d) => { if (made === character && d.reason !== 'clean-exit') reviveCharacter('renderer ' + d.reason); });
   character.webContents.on('did-fail-load', (_event, code, description) => {
     process.stderr.write(`[live2d] load failed ${code}: ${description}\n`);
   });
@@ -808,7 +915,8 @@ function createBubbleWindow() {
   });
   bubble.setIgnoreMouseEvents(true, { forward: true });
   // A hidden bubble never gets mouseleave, so drop back to click-through here.
-  bubble.on('hide', () => { if (!bubble.isDestroyed()) bubble.setIgnoreMouseEvents(true, { forward: true }); });
+  const made = bubble;
+  bubble.on('hide', () => { if (!made.isDestroyed()) made.setIgnoreMouseEvents(true, { forward: true }); });
   bubble.loadFile(path.join(RENDERER_DIR, 'bubble.html'));
 }
 
@@ -830,18 +938,21 @@ function registerIpc() {
   ipcMain.handle('link:settings-get', () => settings());
   ipcMain.handle('screen:displays', () => screen.getAllDisplays().map((d) => ({ id: d.id, bounds: d.bounds, workArea: d.workArea })));
   ipcMain.handle('screen:cursor', () => screen.getCursorScreenPoint());
-  ipcMain.handle('window:bounds', () => (character ? character.getBounds() : null));
+  ipcMain.handle('window:bounds', () => (character ? figureBounds() : null));
+  ipcMain.on('props:shown', (_e, id, png, aspect, needsExpression) => { try { if (props.shown(String(id), png, aspect, needsExpression)) toCharacter('link:settings', settings()); } catch {} });
+  ipcMain.on('props:placed', (_e, id, place) => { try { if (activeModelId) props.place(activeModelId, String(id), place); } catch {} });
   ipcMain.on('window:move', (_e, x, y) => {
-    if (!character || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (!character || character.isDestroyed() || !Number.isFinite(x) || !Number.isFinite(y)) return;
     const b = character.getBounds();
     character.setBounds({ x: Math.round(x), y: Math.round(y), width: b.width, height: b.height });
     if (menu && !menu.isDestroyed() && menu.isVisible()) placeMenu();
     if (bubble && !bubble.isDestroyed() && bubble.isVisible()) placeBubble();
   });
-  ipcMain.on('window:resize', (_e, w, h) => {
-    if (character && Number.isFinite(w) && Number.isFinite(h)) {
-      const b = character.getBounds();
-      character.setBounds({ ...b, width: Math.round(w), height: Math.round(h) });
+  ipcMain.on('window:resize', (_e, w, h, padX = 0, padTop = 0) => {
+    if (character && Number.isFinite(w) && Number.isFinite(h) && Number.isFinite(padX) && Number.isFinite(padTop)) {
+      const b = figureBounds();
+      room = { x: padX, top: padTop };
+      character.setBounds({ x: b.x - padX, y: b.y - padTop, width: Math.round(w), height: Math.round(h) });
       if (menu && !menu.isDestroyed() && menu.isVisible()) placeMenu();
       if (bubble && !bubble.isDestroyed() && bubble.isVisible()) placeBubble();
     }
@@ -861,7 +972,7 @@ function registerIpc() {
     if (action === 'microphone') {
       if (character && !character.webContents.isDestroyed()) character.webContents.send('voice:toggle');
     } else if (action === 'close') {
-      if (menu) menu.hide();
+      if (menu && !menu.isDestroyed()) menu.hide();
     }
   });
   ipcMain.handle('menu:send', (_e, text) => {
@@ -919,7 +1030,17 @@ function registerIpc() {
 }
 
 // ---- the agent's answers: bubble and voice ----
-let front = null;                                                // the chat shown in the bubble: { id, done, at }
+let front = null;                                                // the chat shown in the bubble: { id, done, at, answered, thought, tooled }
+/** Gestures of the agent's turn: once per turn each; "done" only after an answer that was not cancelled. */
+function turnGesture(started, phase, final, text) {
+  if (started) gestureEvent('start');
+  else if (phase === 'thinking' && !front.thought) { front.thought = true; gestureEvent('thinking'); }
+  else if (phase === 'tool' && !front.tooled) { front.tooled = true; gestureEvent('tool'); }
+  else if (phase === 'error' && !front.failed) { front.failed = true; gestureEvent('error'); }
+  if (phase === 'answer') front.answered = final && !!text;
+  else if (phase === 'tool' || phase === 'thinking') front.answered = false;
+  if (phase === 'end' && front.answered && !front.failed) { front.answered = false; gestureEvent('done'); }
+}
 function speakMessage(body) {
   const session = typeof body.session === 'string' ? body.session.slice(0, 200) : '';   // '' = the live2d_speak tool
   const text = String(body.text || ''), final = body.final !== false;
@@ -932,11 +1053,12 @@ function speakMessage(body) {
     else if (phase === 'answer') speech.feed(session, text, final, !aloud());
     else speech.step(session);
   } else if (text && aloud()) speech.line(text);
-  if (!bubble || bubble.isDestroyed()) return;
+  if (hidden || !bubble || bubble.isDestroyed()) return;
   if (session) {                                                 // two agents at once: the bubble stays with the one asked last
     const now = Date.now();
-    if (body.turn === true || !front || front.done || front.id === session || now - front.at > 60000) front = { id: session, done: phase === 'end', at: now };
+    if (body.turn === true || !front || front.done || front.id === session || now - front.at > 60000) front = { ...(front && front.id === session && body.turn !== true ? front : {}), id: session, done: phase === 'end', at: now };
     else return;
+    turnGesture(body.turn === true, phase, final, text);
   }
   if (phase === 'end' || phase === 'idle') {
     // Turn ended: keep a shown answer (bubble.js hides it on its own timer), clear one stuck in thinking/tool.
@@ -951,6 +1073,16 @@ function speakMessage(body) {
   }
 }
 
+// Switched off (hidden), the process ends as soon as the page has its answer: Electron's GPU process keeps the
+// textures for as long as it lives. The plugin starts it again (without windows) when the settings need it;
+// such a start costs little, so it stays for a minute. Polling does not count as use.
+const OFF_EXIT_MS = 1500, LIGHT_EXIT_MS = 60000;
+let lastRequest = Date.now(), inFlight = 0, hadWindows = false, quitting = false;
+function watchOff(isOff) {
+  setInterval(() => { if (isOff() && !inFlight && Date.now() - lastRequest > (hadWindows ? OFF_EXIT_MS : LIGHT_EXIT_MS)) { quitting = true; app.quit(); } }, 500).unref();
+}
+app.on('window-all-closed', () => {});                           // off has no windows; the process ends by watchOff or with DSH
+
 // ---- HTTP control server ----
 // Only the plugin that started this process may drive it: it passes a random token in the environment.
 // Web pages cannot send the header (and any request with an Origin is refused).
@@ -962,6 +1094,7 @@ function allowed(req) {
 }
 const server = http.createServer((req, res) => {
   const json = (code, obj) => { if (res.headersSent || res.destroyed) return; res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  if (quitting) { req.destroy(); return; }                       // too late: the plugin starts a new one and asks that
   if (!allowed(req)) { req.resume(); json(403, { ok: false, error: 'forbidden' }); return; }
   const readBody = () => new Promise((resolve) => {
     let raw = '';
@@ -971,6 +1104,7 @@ const server = http.createServer((req, res) => {
     req.on('close', () => resolve({}));
   });
   const route = String(req.url || '/').split('?')[0];
+  if (route !== '/speak' && route !== '/chat-message') { lastRequest = Date.now(); inFlight++; res.on('close', () => { inFlight--; }); }
   (async () => {
     const body = await readBody();
     if (req.method === 'POST' && route === '/command') {
@@ -1009,6 +1143,8 @@ const server = http.createServer((req, res) => {
     } else if (req.method === 'POST' && route === '/speak') {
       speakMessage(body);
       json(200, { ok: true });
+    } else if (req.method === 'POST' && route === '/props') {
+      json(200, await propsDo(body));
     } else if (req.method === 'POST' && route === '/wait_ready') {
       try { const result = await waitReady(body.timeoutMs || 20000); json(200, { ok: true, result }); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
@@ -1070,6 +1206,10 @@ app.whenReady().then(() => {
       const numeric = /^0\.0\.0\.(\d+)$/.exec(u.hostname);
       const id = numeric ? numeric[1] : u.hostname;
       const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '');
+      if (id === '_props') {                                     // a picture of an accessory: <id>/<number>
+        const [prop, index] = rel.split('/'), picture = props.imageFile(prop, index);
+        return picture ? new Response(new Uint8Array(await fs.promises.readFile(picture)), { headers: { 'content-type': 'image/' + path.extname(picture).slice(1).replace('jpg', 'jpeg') } }) : new Response('Not found', { status: 404 });
+      }
       const base = path.join(MODELS_DIR, id);
       const file = path.join(base, path.normalize(rel));
       if (!file.startsWith(base + path.sep) && file !== base) return new Response('Forbidden', { status: 403 });
@@ -1080,22 +1220,20 @@ app.whenReady().then(() => {
     }
   });
   registerIpc();
-  createCharacterWindow();
-  createBubbleWindow();
-  createMenuWindow();
+  if (!hidden) switchOn();
   server.listen(0, '127.0.0.1', () => {
     const port = server.address().port;
     process.stdout.write(JSON.stringify({ type: 'ready', port }) + '\n');
   });
-  restoreActiveModel();
   watchParent();
+  watchOff(() => hidden);
 });
 
 /** Show the character that was on screen before the restart. */
 async function restoreActiveModel() {
   const id = activeModelId;
   if (!id || !fs.existsSync(path.join(MODELS_DIR, id, 'character.json'))) { activeModelId = ''; return; }
-  if (!(await waitReady(30000))) return;
+  if (!(await waitReady(30000)) || hidden) return;
   try { await loadModel(id); } catch (e) { process.stderr.write(`[live2d] restore failed: ${e && e.message}\n`); }
 }
 

@@ -14,6 +14,8 @@ const COMPANION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'compa
 let port = 0;
 let companion = null;
 let activeModelId = '';
+/** The companion's saved settings: while it is switched off it is not even running. */
+function saved() { try { return JSON.parse(readFileSync(join(COMPANION_DIR, 'settings.json'), 'utf8')) || {}; } catch { return {}; } }
 let speakLog = [];
 function logSpeak(entry) { speakLog.push(entry); if (speakLog.length > 100) speakLog.shift(); }
 
@@ -75,7 +77,7 @@ function ensureCompanion() {
   return starting;
 }
 
-async function http(path, body, timeoutMs = 30000) {
+async function httpOnce(path, body, timeoutMs = 30000) {
   await ensureCompanion();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
@@ -91,6 +93,16 @@ async function http(path, body, timeoutMs = 30000) {
     return data;
   } finally {
     clearTimeout(t);
+  }
+}
+/** Switched off, the companion ends by itself; a request that met it ending goes to a new one. */
+async function http(path, body, timeoutMs = 30000) {
+  try { return await httpOnce(path,body,timeoutMs); }
+  catch (e) {
+    if (/^\/(chat-message|chat-requeue|speak|provider)\b/.test(path)) throw e;   // background traffic never wakes it up
+    if (!(e instanceof TypeError) || saved().hidden !== true) throw e;       // TypeError: no connection (an answer with an error is an Error)
+    for (let i = 0; i < 40 && companion; i++) await new Promise((r) => setTimeout(r, 100));
+    return httpOnce(path,body,timeoutMs);
   }
 }
 
@@ -182,6 +194,7 @@ const looseOutput = {
 
 const MODELS_DIR = join(COMPANION_DIR, 'models');
 const RENDERER_DIR = join(COMPANION_DIR, 'renderer');
+const PROPS_DIR = join(COMPANION_DIR, 'props');
 
 // bubble.html with a stand-in for the Electron preload: speech and tail side come
 // from the parent settings tab via postMessage.
@@ -352,6 +365,23 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+/** The body of a request into a file, not more than limit bytes. */
+function saveUpload(req, file, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const out = createWriteStream(file);
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) { req.destroy(); out.destroy(); reject(new Error('Файл больше ' + Math.round(limit / 1024 / 1024) + ' МБ.')); }
+    });
+    req.pipe(out);
+    out.on('finish', resolve);
+    out.on('error', reject);
+    req.on('error', reject);
+    req.on('aborted', () => { out.destroy(); reject(new Error('Загрузка прервана.')); });
+  });
+}
+
 function readJson(req) {
   return new Promise((resolve) => {
     let buf = '';
@@ -404,7 +434,7 @@ function apply(ctx) {
   watchProviderKey(ctx);
   // Pre-boot the Live2D companion (Electron sidecar) in the background so the
   // first card click does not wait for the ~10s companion boot.
-  ensureCompanion().catch(() => {});
+  if (saved().hidden !== true) ensureCompanion().catch(() => {});   // switched off: not started at all
   // Stream the agent's reply text into the companion's bubble/orb.
   trackAgentSpeech(ctx);
 
@@ -467,10 +497,45 @@ function apply(ctx) {
     async execute(args) { return http('/speak', { text: args.text }); },
   }));
 
+  ctx.tools.register(defineTool({
+    name: 'list_live2d_props',
+    description: 'List the accessories (worn or not) and gestures available for the active Live2D character.',
+    parameters: {},
+    output: looseOutput,
+    async execute() { const r = await http('/props', { op: 'list' }); return { accessories: r.items.filter((p) => p.kind === 'accessory').map((p) => ({ name: p.name, worn: p.on })), gestures: r.items.filter((p) => p.kind === 'gesture').map((p) => p.name) }; },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'live2d_gesture',
+    description: 'Show a gesture next to the Live2D character for a moment (name from list_live2d_props).',
+    parameters: { name: { type: 'string', required: true, description: 'Gesture name.' } },
+    output: looseOutput,
+    async execute(args) { await http('/props', { op: 'show', name: args.name }); return { ok: true }; },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'live2d_wear',
+    description: 'Put an accessory on the active Live2D character or take it off (name from list_live2d_props).',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Accessory name.' },
+      on: { type: 'boolean', required: true, description: 'true = put on, false = take off.' },
+    },
+    output: looseOutput,
+    async execute(args) {
+      const n = String(args.name || '').toLowerCase();
+      const r = await http('/props', { op: 'list' });
+      const p = r.items.find((x) => x.kind === 'accessory' && (x.id === n || x.name.toLowerCase() === n)) || r.items.find((x) => x.kind === 'accessory' && n && x.name.toLowerCase().includes(n));
+      if (!p) throw new Error('Такого аксессуара нет.');
+      await http('/props', { op: 'wear', id: p.id, on: args.on === true });
+      return { ok: true, name: p.name, worn: args.on === true };
+    },
+  }));
+
   // Same-origin HTTP routes for the Settings UI (client half).
   ctx.inject(['webServer'], (hostCtx) => {
     const host = hostCtx.webServer;
     if (!host || typeof host.register !== 'function') return;
+    const IMPORT_TIMEOUT = 10 * 60 * 1000;
     // Another site open in the browser must not reach these routes: its requests are marked cross-site,
     // and it cannot send JSON without a preflight that nobody answers.
     const webServer = {
@@ -503,7 +568,7 @@ function apply(ctx) {
         if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return; }
         if (!activeModelId && companion && port > 0) {
           try { const r = await http('/active', undefined, 3000); if (typeof r.active === 'string') activeModelId = r.active; } catch {}
-        }
+        } else if (!activeModelId) activeModelId = String(saved().activeModelId || '');
         sendJson(res, 200, { active: activeModelId });
       },
     });
@@ -639,13 +704,61 @@ function apply(ctx) {
       path: '/amadeus-live2d/chat-message',
       handler: async (req, res) => {
         if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return; }
+        if (!companion || !port) { sendJson(res, 200, { ok: true, text: '' }); return; }   // polling does not wake it up
         try { const r = await http('/chat-message'); sendJson(res, 200, r); }
         catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
       },
     });
 
+    // ---- Accessories and gestures
+    const uploads = new Map();
+    const PROP_OPS = ['list', 'import_dialog', 'update', 'wear', 'place', 'reset', 'share', 'event', 'seconds', 'remove', 'show', 'adjust'];
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/props',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const body = await readJson(req);
+        if (!PROP_OPS.includes(body.op)) { sendJson(res, 200, { ok: false, error: 'Неизвестная операция.' }); return; }
+        sendJson(res, 200, await http('/props', body, IMPORT_TIMEOUT));
+      },
+    });
+    webServer.register({
+      kind: 'exact',
+      path: '/amadeus-live2d/props-upload',
+      raw: true,                                         // the picture or archive itself is the body
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
+        const name = basename(String(new URL(req.url, 'http://x').searchParams.get('name') || ''));
+        if (!/\.(png|jpe?g|webp|gif|zip|rar|7z)$/i.test(name)) { sendJson(res, 200, { ok: false, error: 'Перетащите картинку (PNG, WebP, GIF, JPEG) или архив .zip, .rar, .7z.' }); req.resume(); return; }
+        // Files dropped together come one after another under one batch name, and are imported as one folder
+        // (front.png + back.png are one thing); the last one says so.
+        const q = new URL(req.url, 'http://x').searchParams, batch = String(q.get('batch') || ''), last = q.get('last') !== '0';
+        const dir = (batch && uploads.get(batch)) || mkdtempSync(join(tmpdir(), 'amadeus-upload-'));
+        if (batch && !last) uploads.set(batch, dir);
+        let done = last;
+        try {
+          await saveUpload(req, join(dir, name), 300 * 1024 * 1024);
+          if (!last) { sendJson(res, 200, { ok: true }); return; }
+          const files = readdirSync(dir), plain = files.filter((f) => !/\.(zip|rar|7z)$/i.test(f)), packed = files.filter((f) => !plain.includes(f));
+          sendJson(res, 200, await http('/props', { op: 'import', paths: [...packed.map((f) => join(dir, f)), ...(plain.length > 1 ? [dir] : plain.map((f) => join(dir, f)))] }, IMPORT_TIMEOUT));
+        } catch (e) { done = true; throw e; }
+        finally { if (done) { uploads.delete(batch); rmSync(dir, { recursive: true, force: true }); } }
+      },
+    });
+    webServer.register({
+      kind: 'prefix',
+      path: '/amadeus-live2d/prop-image',
+      handler: (req, res) => {
+        const m = decodeURIComponent(new URL(req.url, 'http://x').pathname).match(/^\/amadeus-live2d\/prop-image\/([a-z0-9][a-z0-9-]{0,60})\/(image\d+\.(png|jpg|webp|gif))$/);
+        const file = m && join(PROPS_DIR, m[1], m[2]);
+        if (!file || !existsSync(file)) { res.writeHead(404); res.end(); return; }
+        res.writeHead(200, { 'content-type': 'image/' + m[3].replace('jpg', 'jpeg'), 'cache-control': 'max-age=300', 'x-content-type-options': 'nosniff' });
+        createReadStream(file).pipe(res);
+      },
+    });
+
     // ---- Import: native dialog, drag-and-drop upload, recent archives in Downloads ----
-    const IMPORT_TIMEOUT = 10 * 60 * 1000;
     webServer.register({
       kind: 'exact',
       path: '/amadeus-live2d/import-dialog',
@@ -668,18 +781,7 @@ function apply(ctx) {
         const dir = mkdtempSync(join(tmpdir(), 'amadeus-upload-'));
         const file = join(dir, name);
         try {
-          await new Promise((resolve, reject) => {
-            let size = 0;
-            const out = createWriteStream(file);
-            req.on('data', (chunk) => {
-              size += chunk.length;
-              if (size > UPLOAD_LIMIT) { req.destroy(); out.destroy(); reject(new Error('Архив больше 2 ГБ.')); }
-            });
-            req.pipe(out);
-            out.on('finish', resolve);
-            out.on('error', reject);
-            req.on('error', reject);
-          });
+          await saveUpload(req, file, UPLOAD_LIMIT);
           sendJson(res, 200, await http('/import', { paths: [file] }, IMPORT_TIMEOUT));
         } catch (e) {
           sendJson(res, 200, { ok: false, error: e.message });

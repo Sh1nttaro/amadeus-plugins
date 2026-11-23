@@ -129,6 +129,7 @@ function publicSettings() {
 }
 function applySettingsPatch(p) {
   if (!p || typeof p !== 'object') return publicSettings();
+  const wasHidden = settings.hidden;
   if (typeof p.hidden === 'boolean') settings.hidden = p.hidden;
   if (p.control === 'agent' || p.control === 'self') settings.control = p.control;
   if (typeof p.height === 'number' && isFinite(p.height)) settings.height = clamp(Math.round(p.height), 160, 900);
@@ -142,14 +143,15 @@ function applySettingsPatch(p) {
   if (p.voiceDevices && typeof p.voiceDevices === 'object') Object.assign(settings.voiceDevices, sanitizeDevices(p.voiceDevices));
   if (typeof p.radio === 'boolean') settings.radio = p.radio;
   if (p.portrait && typeof p.portrait === 'object') Object.assign(settings.portrait, sanitizePortrait(p.portrait));
-  if (p.listen && typeof p.listen === 'object') { Object.assign(settings.listen, sanitizeListen(p.listen)); if (settings.listen.enabled && !useProviderStt()) sttEnsure(1).catch(() => {}); }
+  if (p.listen && typeof p.listen === 'object') { Object.assign(settings.listen, sanitizeListen(p.listen)); if (settings.listen.enabled && !settings.hidden && !useProviderStt()) sttEnsure(1).catch(() => {}); }
   saveSettings();
   pushSettings();
+  if (settings.hidden && !wasHidden) switchOff();
+  else if (wasHidden && !settings.hidden) switchOn();
   return publicSettings();
 }
 function pushSettings() {
   if (win && !win.isDestroyed()) win.webContents.send('pet:settings', { ...settings, animations: listAnimations() });
-  if (win && !win.isDestroyed()) { if (settings.hidden) win.hide(); else if (!win.isVisible()) win.showInactive(); }
 }
 
 // ---------------------------------------------------------------- voice (same pipeline as live2D)
@@ -490,7 +492,7 @@ async function listenPhrase(buf, follow, onlyStop, session) {
 /** The first synthesis loads the model (~30 s): do it in the background as soon as the voice is on. */
 let kokoroWarmed = false;
 function kokoroWarm() {
-  if (!settings.voice.enabled) return;
+  if (!settings.voice.enabled || settings.hidden) return;
   if (settings.voice.engine === 'edge') { edgeEnsure().catch(() => {}); return; }   // Edge: start its server before the first answer
   if (settings.voice.engine === 'silero') { sileroEnsure().catch(() => {}); return; }   // Silero: load the model (~3 s)
   if (kokoroWarmed) return;
@@ -779,6 +781,7 @@ function startHelper() {
 }
 function queryWorld() {
   return new Promise((resolve) => {
+    if (settings.hidden) return resolve(null);
     if (!helper) startHelper();
     if (!helper || helperWaiting) return resolve(null);
     const t = setTimeout(() => { if (helperWaiting) { helperWaiting = null; resolve(null); } }, 1500);
@@ -812,8 +815,9 @@ const pending = new Map();
 function overlayArea() { return screen.getPrimaryDisplay().workArea; }
 
 function createWindow() {
+  hadWindows = true;
   const area = overlayArea();
-  win = new BrowserWindow({
+  const made = win = new BrowserWindow({
     x: area.x, y: area.y, width: area.width, height: area.height,
     transparent: true, frame: false, resizable: false, movable: false, hasShadow: false,
     alwaysOnTop: true, skipTaskbar: true, focusable: false, show: false,
@@ -824,16 +828,39 @@ function createWindow() {
   win.setIgnoreMouseEvents(true, { forward: true });
   win.webContents.on('console-message', (_e, level, message) => { if (level >= 2) process.stderr.write('[pet] ' + message + '\n'); });
   win.loadFile(path.join(RENDERER_DIR, 'pet.html'));
-  win.once('ready-to-show', () => { if (!settings.hidden) win.showInactive(); });
+  win.once('ready-to-show', () => { if (!made.isDestroyed() && !settings.hidden) made.showInactive(); });
+}
+function watchDisplays() {
   const refit = () => { if (win && !win.isDestroyed()) { const a = overlayArea(); win.setBounds({ x: a.x, y: a.y, width: a.width, height: a.height }); } };
   screen.on('display-metrics-changed', refit);
   screen.on('display-added', refit);
   screen.on('display-removed', refit);
 }
 
+/** Hidden = off: the window with the model, its textures and the voice servers are gone from memory. */
+const OFF_TEXT = 'Персонаж выключен: включите «Показывать персонажа» в настройках live3D.';
+function switchOff() {
+  if (win && !win.isDestroyed()) win.destroy();
+  win = null; winFaded = null; lastWorld = null;
+  for (const [id, p] of pending) { clearTimeout(p.t); pending.delete(id); p.resolve({ ok: false, error: OFF_TEXT }); }
+  stopServers();
+  kokoroWarmed = false;
+}
+function switchOn() {
+  if (!win || win.isDestroyed()) createWindow();
+  startHelper();
+  setTimeout(kokoroWarm, 4000);                                  // voice on: load the voice before the first answer
+  setTimeout(() => { if (settings.listen.enabled && !settings.hidden && !useProviderStt()) sttEnsure(1).catch(() => {}); }, 3000);   // listening on: load Whisper before the first phrase
+  if (settings.activeModelId && modelInfo(settings.activeModelId)) selectModel(settings.activeModelId).catch((e) => process.stderr.write('[pet] restore failed: ' + e.message + '\n'));
+}
+function stopServers() {
+  for (const p of [helper, kokoroProcess, sttProcess, edgeProcess, sileroProcess]) { try { if (p && p.exitCode === null) p.kill(); } catch {} }
+  kokoroProcess = sttProcess = edgeProcess = sileroProcess = null;   // a killed process keeps exitCode null: forget it, or it would never start again
+}
+
 function sendCommand(command, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    if (!win || win.isDestroyed()) return reject(new Error('Окно 3D не запущено.'));
+    if (!win || win.isDestroyed()) return reject(new Error(settings.hidden ? OFF_TEXT : 'Окно 3D не запущено.'));
     const id = crypto.randomUUID();
     const t = setTimeout(() => { pending.delete(id); reject(new Error('Окно 3D не ответило вовремя.')); }, timeoutMs);
     pending.set(id, { resolve, t });
@@ -858,6 +885,7 @@ function waitReady(timeoutMs = 20000) {
 async function selectModel(id) {
   const info = id && MODEL_ID.test(id) ? modelInfo(id) : null;
   if (!info) throw new Error('Модель не найдена.');
+  if (settings.hidden) { settings.activeModelId = id; saveSettings(); return { ok: true }; }   // off: she appears with it when switched on
   if (!(await waitReady())) throw new Error('Окно 3D не готово.');
   const result = await sendCommand({ name: 'load_model', args: { url: SCHEME + '://' + id + '/' + encodeURIComponent(info.file), id } }, 60000);
   if (!result || !result.ok) throw new Error((result && result.error) || 'Не удалось загрузить модель.');
@@ -952,9 +980,20 @@ function allowed(req) {
   const got = Buffer.from(String(req.headers['x-amadeus-token'] || '')), want = Buffer.from(TOKEN);
   return !req.headers.origin && got.length === want.length && crypto.timingSafeEqual(got, want);
 }
+// Switched off (hidden), the process ends as soon as the page has its answer: Electron's GPU process keeps the
+// textures for as long as it lives. The plugin starts it again (without windows) when the settings need it;
+// such a start costs little, so it stays for a minute. Polling does not count as use.
+const OFF_EXIT_MS = 1500, LIGHT_EXIT_MS = 60000;
+let lastRequest = Date.now(), inFlight = 0, hadWindows = false, quitting = false;
+function watchOff(isOff) {
+  setInterval(() => { if (isOff() && !inFlight && Date.now() - lastRequest > (hadWindows ? OFF_EXIT_MS : LIGHT_EXIT_MS)) { quitting = true; app.quit(); } }, 500).unref();
+}
 const server = http.createServer(async (req, res) => {
+  if (quitting) { req.destroy(); return; }                       // too late: the plugin starts a new one and asks that
   if (!allowed(req)) { req.resume(); return json(res, 403, { ok: false, error: 'forbidden' }); }
   const route = req.url.split('?')[0];
+  const polling = route === '/speak' || route === '/chat-message';
+  if (!polling) { lastRequest = Date.now(); inFlight++; res.on('close', () => { inFlight--; }); }
   const body = await readBody(req);
   try {
     if (req.method === 'POST' && route === '/command') {
@@ -1063,13 +1102,11 @@ function watchParent() {
   setInterval(() => { try { process.kill(parent, 0); } catch { app.quit(); } }, 5000).unref();
 }
 
-app.on('window-all-closed', () => app.quit());
-app.on('will-quit', () => { try { helper && helper.kill(); } catch {} try { if (kokoroProcess && kokoroProcess.exitCode === null) kokoroProcess.kill(); } catch {} try { if (sttProcess && sttProcess.exitCode === null) sttProcess.kill(); } catch {} try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} try { if (sileroProcess && sileroProcess.exitCode === null) sileroProcess.kill(); } catch {} });
+app.on('window-all-closed', () => { if (!settings.hidden) app.quit(); });   // switched off there is no window; watchOff ends the process
+app.on('will-quit', stopServers);
 
 app.whenReady().then(async () => {
   loadSettings();
-  setTimeout(kokoroWarm, 4000);                                  // voice on: load Kokoro before the first answer
-  setTimeout(() => { if (settings.listen.enabled && !useProviderStt()) sttEnsure(1).catch(() => {}); }, 3000);   // listening on: load Whisper before the first phrase
   protocol.handle(SCHEME, (req) => {
     try {
       const u = new URL(req.url);
@@ -1082,12 +1119,12 @@ app.whenReady().then(async () => {
     } catch { return new Response('Not found', { status: 404 }); }
   });
   registerIpc();
-  createWindow();
-  startHelper();
+  watchDisplays();
+  if (!settings.hidden) switchOn();
   startWorldLoop();
   watchParent();
+  watchOff(() => settings.hidden);
   server.listen(0, '127.0.0.1', () => {
     process.stdout.write(JSON.stringify({ type: 'ready', port: server.address().port }) + '\n');
   });
-  if (settings.activeModelId && modelInfo(settings.activeModelId)) selectModel(settings.activeModelId).catch((e) => process.stderr.write('[pet] restore failed: ' + e.message + '\n'));
 });

@@ -27352,6 +27352,65 @@ class Live2DCharacter extends CubismUserModel {
     }
     return Number.isFinite(minX) ? { minX, maxX, minY, maxY } : this.figure;
   }
+  /** For props.mjs: the figure with some parameters moved ("far" from the default, or "max"); null when it has none of them. */
+  probe(map) {
+    const model = this._model, names = this._model._model.parameters.ids;
+    for (let index = 0; index < model.getParameterCount(); index++) model.setParameterValueByIndex(index, model.getParameterDefaultValue(index));
+    for (const [name, side] of Object.entries(map)) {
+      const index = names.indexOf(name);
+      if (index < 0) return null;
+      const low = model.getParameterMinimumValue(index), high = model.getParameterMaximumValue(index), rest = model.getParameterDefaultValue(index);
+      model.setParameterValueByIndex(index, side === "far" && rest - low > high - rest ? low : high);
+    }
+    model.update();
+    const vertices = [], visible = [];
+    for (let index = 0; index < model.getDrawableCount(); index++) {
+      vertices.push(Float32Array.from(model.getDrawableVertexPositions(index)));
+      visible.push(model.getDrawableDynamicFlagIsVisible(index) && model.getDrawableOpacity(index) > 0.01);
+    }
+    return { vertices, visible };
+  }
+  /** A Live2D accessory: moved by the parameters of the character that wears it (the turn of the head is tracked on screen already). */
+  updateAs(host, seconds) {
+    const model = this._model, own = model._model.parameters.ids, theirs = host._model._model.parameters.ids;
+    if (!this.sharedWith || this.sharedWith.host !== host) {
+      const pairs = [];
+      own.forEach((name, index) => {
+        const other = theirs.indexOf(name);
+        if (other >= 0 && /^Param(Angle[XY]|BodyAngle[XYZ]|Breath|MouthOpenY|MouthForm|Eye[LR]Open|EyeBall[XY])$/.test(name)) pairs.push([index, other]);
+      });
+      this.sharedWith = { host, pairs };
+    }
+    for (let index = 0; index < own.length; index++) model.setParameterValueByIndex(index, model.getParameterDefaultValue(index));
+    for (const [index, other] of this.sharedWith.pairs) model.setParameterValueByIndex(index, host._model.getParameterValueByIndex(other));
+    this._expressionManager?.updateMotion(model, seconds);
+    this._physics?.evaluate(model, seconds);
+    this._pose?.updateParameters(model, seconds);
+    model.update();
+  }
+  /** Is anything of it visible at rest? */
+  empty() {
+    const model = this._model;
+    for (let index = 0; index < model.getDrawableCount(); index++) if (model.getDrawableDynamicFlagIsVisible(index) && model.getDrawableOpacity(index) > 0.01) return false;
+    return true;
+  }
+  clearExpression() {
+    this._expressionManager.stopAllMotions();
+  }
+  probeDone() {
+    this.resetParameters();
+    this._model.update();
+  }
+  /** Where the vertices found by props.mjs are now. */
+  pointsNow(points) {
+    return points.map((p) => {
+      const vertices = this._model.getDrawableVertexPositions(p.d);
+      return { x: vertices[p.i], y: vertices[p.i + 1] };
+    });
+  }
+  yaw() {
+    return this._model.getParameterValueById(this.ids.angleX);
+  }
   /** Width/height of the figure, for sizing the window around it. */
   get aspect() {
     return (this.figure.maxX - this.figure.minX) / (this.figure.maxY - this.figure.minY);
@@ -27465,6 +27524,7 @@ class Live2DCharacter extends CubismUserModel {
     this.release();
   }
 }
+window.AmadeusLive2D = Live2DCharacter;
 const HEIGHT = 480;
 const FIGURE_HEIGHT$1 = 1.88;
 const FEET_Y$1 = -0.98;
@@ -27886,10 +27946,19 @@ class Stage {
     this.pixel = new Uint8Array(4);
     this.previewed = /* @__PURE__ */ new Set();
     this.unsubscribe = [];
+    this.props = new window.AmadeusProps(canvas, api);
+    this.props.onRoom = () => this.layout();
+    // The canvas is the figure's box; the window may be larger, with room for accessories around it.
     this.resizeCanvas = () => {
-      const ratio = window.devicePixelRatio || 1;
-      this.canvas.width = Math.max(1, Math.round(window.innerWidth * ratio));
-      this.canvas.height = Math.max(1, Math.round(window.innerHeight * ratio));
+      const ratio = window.devicePixelRatio || 1, pad = this.props.pad;
+      this.canvas.style.left = `${pad.x}px`;
+      this.canvas.style.top = `${pad.top}px`;
+      this.canvas.style.width = `${this.size.width}px`;
+      this.canvas.style.height = `${this.size.height}px`;
+      const width = Math.max(1, Math.round(this.size.width * ratio)), height = Math.max(1, Math.round(this.size.height * ratio));
+      if (this.canvas.width === width && this.canvas.height === height) return;
+      this.canvas.width = width;
+      this.canvas.height = height;
       this.character?.resizeView(this.canvas.width, this.canvas.height);
       this.paint();
     };
@@ -27956,11 +28025,12 @@ class Stage {
       const bob = walking ? -Math.abs(wave) * 5 : 0;
       const position = { x: Math.round(behavior.feet.x - width / 2), y: Math.round(behavior.feet.y - height * 0.99 + bob) };
       if (position.x !== this.lastPosition.x || position.y !== this.lastPosition.y) {
-        this.api.move(position.x, position.y);
+        this.api.move(position.x - this.props.pad.x, position.y - this.props.pad.top);
         this.lastPosition = position;
       }
       character.update(step);
       this.paint();
+      this.props.frame(this.size, step);
       this.hitTest(position);
     };
     this.voice = new Voice(api, () => this.settings, (state, note) => {
@@ -28037,6 +28107,7 @@ class Stage {
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("contextmenu", this.onContextMenu);
     for (const off of this.unsubscribe) off();
+    this.props.dispose();
     this.character?.dispose();
     this.character = null;
     void this.voice.stop(false);
@@ -28070,11 +28141,13 @@ class Stage {
         this.behavior?.setEnabled(name, enabled);
       }
     }
+    if (settings.props && settings.propsFor === this.modelId) this.setProps(settings.props);
     const scale = clamp(Number(settings.modelScale) || 1, 0.5, 2);
     if (Math.abs(scale - this.scaleTarget) > 1e-4) this.askScale(scale);
     const wanted = this.wantedModel(settings);
     if (wanted === this.modelId) return this.loading;
     this.modelId = wanted;
+    this.props.set(settings.props);
     this.loading = this.loading.then(() => this.showModel(wanted));
     return this.loading;
   }
@@ -28082,6 +28155,7 @@ class Stage {
     if (this.stopped || modelId !== this.modelId) return { ok: true };
     this.cancelPoseTimer();
     if (!modelId) {
+      this.props.setCharacter(null);
       this.character?.dispose();
       this.character = null;
       this.api.setVisible(false);
@@ -28099,6 +28173,7 @@ class Stage {
       character.fit(FIGURE_HEIGHT, FEET_Y);
       this.character?.dispose();
       this.character = character;
+      this.props.setCharacter(character);
       await this.placeCharacter();
       this.api.setVisible(true);
       void this.ensurePreview(modelId);
@@ -28118,6 +28193,13 @@ class Stage {
     if (await this.api.hasPreview(modelId)) return;
     const result = await renderPreview(this.api, modelId);
     if (!result.ok) console.warn(`preview ${modelId}: ${result.error}`);
+  }
+  /** Accessories changed: draw them, and give them room if they need another amount of it. */
+  setProps(view) {
+    this.props.set(view);
+    if (!this.character) return;
+    const room = this.props.room(this.size), pad = this.props.pad;
+    if (room.x !== pad.x || room.top !== pad.top) this.layout();
   }
   /** Ease the figure's size toward the target; true while it is still moving. */
   animateScale(now) {
@@ -28150,7 +28232,9 @@ class Stage {
     const height = Math.round(BASE_HEIGHT * this.scale);
     const width = Math.round(clamp(height * (FIGURE_HEIGHT / 2) * character.aspect * 1.25, 140, 900));
     this.size = { width, height };
-    this.api.resize(width, height);
+    const pad = this.props.pad = this.props.room(this.size);
+    this.api.resize(width + pad.x * 2, height + pad.top, pad.x, pad.top);
+    this.resizeCanvas();
     this.behavior?.setSize(width, height);
     this.lastPosition = { x: NaN, y: NaN };
   }
@@ -28163,6 +28247,7 @@ class Stage {
     const feet = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height * 0.99 };
     const behavior = new Behavior(this.api, feet, () => {
       if (this.character?.playReaction()) this.schedulePoseReset(POSE_RESET_MS);
+      this.props.event("click");
     });
     behavior.setDisplays(this.displays);
     for (const [name, enabled] of Object.entries(this.behaviors)) behavior.setEnabled(name, enabled);
@@ -28218,6 +28303,16 @@ class Stage {
         this.schedulePoseReset(POSE_RESET_MS);
         return { ok: true, label: name };
       }
+      case "gesture":
+        if (args.event) {
+          this.props.event(String(args.event));
+          return { ok: true };
+        }
+        return this.props.show(String(args.id ?? ""), Number(args.seconds) || 0);
+      case "adjust_prop":
+        this.props.adjust(String(args.id ?? ""));
+        this.layout();
+        return { ok: true, adjusting: this.props.adjusting };
       case "return_to_idle":
         this.cancelPoseTimer();
         character.resetPose();
@@ -28318,7 +28413,7 @@ class Stage {
       hovering = this.pixel[3] > ALPHA_HIT;
     }
     this.hovering = hovering;
-    const interactive = hovering || this.behavior?.mode === "drag";
+    const interactive = hovering || this.behavior?.mode === "drag" || this.props.over(local.x + this.props.pad.x, local.y + this.props.pad.top);
     if (interactive !== this.interactive) {
       this.interactive = interactive;
       this.api.setInteractive(interactive);

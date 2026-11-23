@@ -213,3 +213,20 @@ test('every call of the preload has a handler in the main process', () => {
   }
   for (const [, name] of src('companion/renderer/menu.html').matchAll(/\bapi\.(\w+)/g)) assert.match(preload, new RegExp('^  ' + name + ':', 'm'));
 });
+
+// ---------------------------------------------------------------- switched off
+for (const [name, code, off] of [['live2D', lib, 'saved'], ['live3D', src('../amadeus-live3d/lib/index.js'), 'switchedOff']]) {
+  test(name + ' off: a request that met the process ending goes to a new one, polling wakes nothing', async () => {
+    const run = (isOff, error) => {
+      let n = 0;
+      const f = new Function('httpOnce', 'companion', 'saved', 'switchedOff', between(code, 'async function http(', '\n}\n') + '\n}\nreturn http;')(
+        async () => { if (++n === 1) throw error; return 'ok'; }, null, () => ({ hidden: isOff }), () => isOff);
+      return async (p) => { try { return await f(p); } catch (e) { return e.constructor.name; } };
+    };
+    const lost = new TypeError('fetch failed');
+    assert.equal(await run(true, lost)('/settings'), 'ok');
+    for (const p of ['/chat-message', '/chat-message?wait=15000', '/speak', '/provider']) assert.equal(await run(true, lost)(p), 'TypeError', p);
+    assert.equal(await run(false, lost)('/settings'), 'TypeError');
+    assert.equal(await run(true, new Error('отказ'))('/settings'), 'Error');
+  });
+}

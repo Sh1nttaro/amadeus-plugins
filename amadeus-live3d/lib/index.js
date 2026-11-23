@@ -63,7 +63,7 @@ function ensureCompanion() {
   return starting;
 }
 
-async function http(route, body, timeoutMs = 30000, signal = null) {
+async function httpOnce(route, body, timeoutMs = 30000, signal = null) {
   await ensureCompanion();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
@@ -80,6 +80,16 @@ async function http(route, body, timeoutMs = 30000, signal = null) {
     return data;
   } finally { clearTimeout(t); }
 }
+/** Switched off, the companion ends by itself; a request that met it ending goes to a new one. */
+async function http(route, body, timeoutMs = 30000, signal = null) {
+  try { return await httpOnce(route,body,timeoutMs,signal); }
+  catch (e) {
+    if (/^\/(chat-message|chat-requeue|speak|provider)\b/.test(route)) throw e;   // background traffic never wakes it up
+    if (!(e instanceof TypeError) || !switchedOff()) throw e;       // TypeError: no connection (an answer with an error is an Error)
+    for (let i = 0; i < 40 && companion; i++) await new Promise((r) => setTimeout(r, 100));
+    return httpOnce(route,body,timeoutMs,signal);
+  }
+}
 async function command(cmdName, args) {
   const r = await http('/command', { name: cmdName, args: args || {} });
   const res = r.result;
@@ -87,6 +97,8 @@ async function command(cmdName, args) {
   return res;
 }
 
+/** Switched off ("Показывать персонажа"): the companion is not started, and ends by itself. */
+function switchedOff() { try { return JSON.parse(readFileSync(path.join(COMPANION_DIR, 'settings.json'), 'utf8')).hidden === true; } catch { return false; } }
 /** The last shown model comes back after a restart: start the companion only if there is one. */
 function savedActiveModel() {
   try { return JSON.parse(readFileSync(path.join(COMPANION_DIR, 'settings.json'), 'utf8')).activeModelId || ''; } catch { return ''; }
@@ -249,7 +261,7 @@ const ACTIONS = ['sleep', 'wake', 'sit', 'stand', 'come', 'jump', 'wave', 'dance
 const MOODS = ['happy', 'excited', 'love', 'proud', 'relaxed', 'thinking', 'surprised', 'shy', 'scared', 'sad', 'pout', 'angry', 'sleepy', 'dizzy'];
 const catalog = { clips: [], at: 0 };
 async function refreshCatalog() {
-  if (!companion || !port) return;
+  if (!companion || !port || switchedOff()) return;              // asking would keep a switched-off companion running
   try {
     const st = await http('/settings', undefined, 5000);
     const names = [];
@@ -313,7 +325,7 @@ function companionChatDir() {
 function readChat() { try { return JSON.parse(readFileSync(CHAT_FILE, 'utf8')); } catch { return { sessions: {} }; } }
 
 function apply(ctx) {
-  if (savedActiveModel()) ensureCompanion().catch(() => {});
+  if (savedActiveModel() && !switchedOff()) ensureCompanion().catch(() => {});
   watchProviderKey(ctx);
   trackAgentSpeech(ctx);
   const timers = [setInterval(refreshCatalog, 60000), setTimeout(refreshCatalog, 8000)];
@@ -321,7 +333,7 @@ function apply(ctx) {
   if (typeof ctx.on === 'function') {
     ctx.on('system-prompt/assemble', async (assembly, _hostCtx, next) => {
       try {
-        if (companion && port && assembly && Array.isArray(assembly.contexts)) {
+        if (companion && port && !switchedOff() && assembly && Array.isArray(assembly.contexts)) {
           assembly.contexts.push({ name: 'amadeus-live3d:companion', text: companionPrompt().replace(/\{\{/g, '{ {') });
         }
       } catch {}
@@ -489,7 +501,7 @@ function apply(ctx) {
         return { ok: true };
       }
       let model = null;
-      try { const r = await http('/list', undefined, 5000); const m = (r.models || []).find((x) => x.id === r.active); if (m) model = { id: m.id, name: m.name || m.id }; } catch {}
+      if (companion && port) try { const r = await http('/list', undefined, 5000); const m = (r.models || []).find((x) => x.id === r.active); if (m) model = { id: m.id, name: m.name || m.id }; } catch {}
       if (!model && savedActiveModel()) model = { id: savedActiveModel(), name: savedActiveModel() };
       return { ok: true, path: companionChatDir(), workspaceId: st.workspaceId || '', sessions: st.sessions || {}, model };
     });

@@ -28,3 +28,6 @@ amadeus-providers/data.json
 
 # Per-user harness settings and sessions
 amadeus-harness/data/
+
+# Accessories and gestures the user imported into live2D
+**/companion/props/
