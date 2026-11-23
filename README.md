@@ -10,6 +10,8 @@
 | `amadeus-live3d` | ✅ | ✅ | ✅ (проверен standalone) |
 | `amadeus-orb` | ✅ | ✅ | ✅ (автопривязка фаз, вид по состояниям) |
 | `amadeus-live2d` | ✅ | ✅ | ✅ (пузырь ответов, импорт моделей) |
+| `amadeus-providers` | ✅ | ✅ | ✅ (проверка на настоящем LiteLLM, тесты) |
+| `amadeus-harness` | ✅ | ✅ | ✅ (Claude Code и Codex через LiteLLM, ход через цикл агента DSH) |
 
 ---
 
@@ -86,10 +88,25 @@
 
 ---
 
+## 4. `amadeus-providers` — свои провайдеры моделей
+
+Страница настроек «Провайдеры»: подключить OpenAI-/Anthropic-/Gemini-совместимый адрес, нажать
+«Проверить» (список моделей, контекст, возможности, цена за 1M токенов), шторкой включить нужные.
+Подробнее: [`amadeus-providers/README.md`](amadeus-providers/README.md).
+
+## 5. `amadeus-harness` — Claude Code и Codex как исполнители чата
+
+Харнесы появляются в выборе модели чата (маршруты `llm`), ход выполняет Claude Code или Codex со
+своими инструментами в папке чата, через ваше подключение. Подробнее:
+[`amadeus-harness/README.md`](amadeus-harness/README.md).
+
+---
+
 ## Установка в DSH (общая схема)
 
-1. Скопировать папку плагина в `C:\Users\epevn\.dsh\profiles\desktop\node_modules\`.
-2. В `package.json` профиля добавить в `dependencies` (`"<имя>": "<версия>"`) и в
+1. Скопировать папку плагина в `C:\Users\epevn\.dsh\profiles\desktop\plugins\<имя>` и сделать ссылку
+   (junction) `C:\Users\epevn\.dsh\profiles\desktop\node_modules\<имя>` на неё.
+2. В `package.json` профиля добавить в `dependencies` (`"<имя>": "link:./plugins/<имя>"`) и в
    `dsh.profile.bundles`.
 3. **Перезапустить `DeepSeek Harness.exe`** (закрыть → открыть) — без перезапуска плагины
    не активируются.
