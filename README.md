@@ -262,7 +262,9 @@ Live2D Inc.) и открытые обёртки вокруг неё.
   `python -m unittest discover amadeus-live3d/test`.
 - `build-clients.cjs` пересобирает `lib/client.js` live2D / live3D из исходников amadeus-v2 —
   нужен только тому, у кого есть его исходники; плагинам для работы не нужен.
-- `amadeus-live2d/_test.cjs` — проверка live2D без DSH (путь к Electron внутри — поправьте под
-  свой runtime).
+- Тесты live2D: `node --test amadeus-live2d/test/live2d.test.mjs`.
+- live2D рисует на видеокарте; если она дважды подвела (зависла при загрузке модели, теряет картинку),
+  сам переходит на программный рендер (до двух ядер процессора). `AMADEUS_LIVE2D_SWIFTSHADER=1` —
+  всегда программный, `=0` — всегда видеокарта; `companion/gpu.json` можно удалить, чтобы попробовать снова.
 - Плагины используют скоуп `@deepseek-ai/*` ванильного DSH (`cordis`, `dsh-tools` — peer-зависимости,
   их даёт сам DSH); своих npm-зависимостей у плагинов нет.

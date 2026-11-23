@@ -145,4 +145,5 @@ class H(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     below_normal_priority()
     threading.Thread(target=load, daemon=True).start()
+    ThreadingHTTPServer.allow_reuse_address = False              # Windows would let two servers share the port
     ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()

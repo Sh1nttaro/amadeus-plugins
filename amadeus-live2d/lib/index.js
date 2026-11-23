@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, createReadStream, createWriteStream, mkdtempSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -16,19 +17,22 @@ let activeModelId = '';
 let speakLog = [];
 function logSpeak(entry) { speakLog.push(entry); if (speakLog.length > 100) speakLog.shift(); }
 
+// The companion only listens to us: a random token in its environment, sent with every request.
+const TOKEN = randomBytes(24).toString('hex');
+
 function electronBinary() {
-  // The DSH host child runs in Node mode; spawning process.execPath (the DSH app
-  // itself) re-triggers its single-instance/cache lock and exits immediately.
-  // Prefer a standalone Electron binary from the shared runtime folder (setup/install-runtime.ps1
-  // puts it there), falling back to process.execPath.
+  // A standalone Electron from the shared runtime folder (setup/install-runtime.ps1 puts it there):
+  // the DSH binary itself cannot be used — its single-instance lock makes it exit at once.
   const runtime = process.env.AMADEUS_RUNTIME || 'W:\\amadeus-runtime';
   const cand = process.env.AMADEUS_COMPANION_ELECTRON || join(runtime, 'electron', 'electron.exe');
-  return (cand && existsSync(cand)) ? cand : process.execPath;
+  if (!existsSync(cand)) throw new Error('Не найден Electron (' + cand + '). Установите runtime: amadeus-live2d\\setup\\install-runtime.ps1');
+  return cand;
 }
 
 let starting = null;
 let failedAt = 0;
 const RETRY_AFTER_MS = 10000;
+const EXIT_SOFTWARE = 75;                                        // the companion gave the GPU up: start it again at once
 process.once('exit', () => { try { companion?.kill(); } catch {} });
 
 function ensureCompanion() {
@@ -36,7 +40,7 @@ function ensureCompanion() {
   if (starting) return starting;
   if (Date.now() - failedAt < RETRY_AFTER_MS) return Promise.reject(new Error('Компаньон Live2D недоступен, повторю попытку чуть позже.'));
   starting = new Promise((resolve, reject) => {
-    const env = { ...process.env, AMADEUS_PARENT_PID: String(process.pid) };
+    const env = { ...process.env, AMADEUS_PARENT_PID: String(process.pid), AMADEUS_TOKEN: TOKEN };
     if (providerKey && !env.LITELLM_API_KEY) env.LITELLM_API_KEY = providerKey;
     delete env.ELECTRON_RUN_AS_NODE;
     const child = spawn(electronBinary(), [COMPANION_DIR], { stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true });
@@ -63,8 +67,11 @@ function ensureCompanion() {
     child.stdout.on('data', onData);
     child.stderr.resume();
     child.on('error', fail);
-    child.on('exit', () => { if (companion === child) { companion = null; port = 0; } });
-  }).finally(() => { starting = null; });
+    child.on('exit', (code) => {
+      if (companion === child) { companion = null; port = 0; }
+      if (code === EXIT_SOFTWARE) { failedAt = 0; setTimeout(() => ensureCompanion().catch(() => {}), 300); }
+    });
+  }).catch((e) => { failedAt = Date.now(); throw e; }).finally(() => { starting = null; });
   return starting;
 }
 
@@ -75,7 +82,7 @@ async function http(path, body, timeoutMs = 30000) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      headers: { 'x-amadeus-token': TOKEN, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ac.signal,
     });
@@ -87,60 +94,63 @@ async function http(path, body, timeoutMs = 30000) {
   }
 }
 
-// The web client (lib/client.js wireSpeech) also streams the reply via
-// /amadeus-live2d/speak. While it is streaming answer text the host bridge stays
-// quiet so the bubble does not get two interleaved feeds.
-let lastClientSpeakAt = 0;
-const CLIENT_SPEAK_GRACE_MS = 5000;
-
-// Host-side agent speech bridge — mirrors amadeus-v2's trackDefaultLoop
-// (amadeus-client-ui-harness/lib/index.js): subscribe to the agent's streamed
-// chunks, track the phase (thinking/tool/answer) for the orb + dots, accumulate
-// the text and forward both to the companion's /speak.
+// The agent's reply, streamed into the companion: phases (connecting/thinking/tool/answer) + the text.
+// This is the only feed: it knows which chat (session) a text belongs to.
 function trackAgentSpeech(ctx) {
   if (typeof ctx.on !== 'function') return;
   const trackers = new Map();
   const forAgent = (agent) => {
     const id = (agent && agent.session && agent.session.id) || (agent && agent.id) || 'default';
     let t = trackers.get(id);
-    if (!t) { t = { speech: '', phase: 'idle', status: '', lastAt: 0 }; trackers.set(id, t); }
+    if (!t) { t = { id: String(id), speech: '', phase: 'idle', status: '', lastAt: 0, fresh: true, out: [], sending: false }; trackers.set(id, t); }
     return t;
   };
-  const send = (t, final, force) => {
+  const send = (t, final, force, extra) => {
     const now = Date.now();
     if (!force && !final && now - t.lastAt < 200) return;
     t.lastAt = now;
-    const skip = now - lastClientSpeakAt < CLIENT_SPEAK_GRACE_MS;
-    logSpeak({ t: now, src: skip ? 'host-skip' : 'host', phase: t.phase, text: t.speech.slice(0, 160), final });
-    if (skip) return;
-    const body = { text: t.speech, final, phase: t.phase, status: t.status };
-    http('/speak', body).catch(() => {});
+    post(t, { session: t.id, text: t.speech, final, phase: t.phase, status: t.status, ...extra });
+  };
+  // One message at a time per session: the end of an answer must never overtake its text. While one is
+  // on its way, newer text replaces the unsent older one.
+  const post = (t, m) => {
+    if (!companion || !port) return;                     // only when the companion is running
+    logSpeak({ t: Date.now(), session: t.id, phase: m.phase, text: String(m.text || '').slice(0, 160), final: m.final });
+    const last = t.out[t.out.length - 1];
+    if (last && last.phase === 'answer' && !last.final && m.phase === 'answer') t.out[t.out.length - 1] = m; else t.out.push(m);
+    if (!t.sending) pump(t);
+  };
+  const pump = async (t) => {
+    t.sending = true;
+    while (t.out.length) { try { await http('/speak', t.out.shift(), 5000); } catch {} }
+    t.sending = false;
   };
   const setPhase = (t, phase, status, final) => {
     if (t.phase === phase && t.status === status) return;
-    t.phase = phase;
-    t.status = status;
+    t.phase = phase; t.status = status;
     send(t, final, true);
   };
   ctx.on('agent/assistant-stream', (payload) => {
     const frame = payload && payload.frame;
     if (!frame) return;
     const t = forAgent(payload && payload.agent);
-    if (frame.type === 'start') { t.speech = ''; setPhase(t, 'connecting', 'Подключаюсь…', false); return; }
+    if (frame.type === 'start') {
+      t.speech = '';
+      if (t.fresh) {                                     // the first step of a new turn: the previous answer is not read any further
+        t.fresh = false; t.phase = 'connecting'; t.status = 'Подключаюсь…';
+        send(t, false, true, { turn: true });
+      } else setPhase(t, 'connecting', 'Подключаюсь…', false);
+      return;
+    }
     if (frame.type === 'end') return;
     const chunk = frame.chunk;
     if (!chunk) return;
     switch (chunk.type) {
-      case 'reasoning-delta':
-        setPhase(t, 'thinking', 'Думаю…', false);
-        return;
-      case 'tool-call-delta':
-        setPhase(t, 'tool', chunk.name || 'Инструмент', false);
-        return;
+      case 'reasoning-delta': setPhase(t, 'thinking', 'Думаю…', false); return;
+      case 'tool-call-delta': setPhase(t, 'tool', chunk.name || 'Инструмент', false); return;
       case 'text-delta':
         if (typeof chunk.text === 'string') t.speech += chunk.text;
-        t.phase = 'answer';
-        t.status = '';
+        t.phase = 'answer'; t.status = '';
         send(t, false, false);
         return;
       case 'finish':
@@ -152,11 +162,11 @@ function trackAgentSpeech(ctx) {
   ctx.on('agent/status', (payload) => {
     if (!payload || payload.status !== 'idle') return;
     const t = forAgent(payload.agent);
-    t.speech = '';
-    // After an answer the bubble shows it and hides itself; only clear a bubble
-    // stuck in thinking/tool (turn stopped without an answer).
-    if (t.phase === 'answer' || t.phase === 'error') { t.phase = 'idle'; t.status = ''; return; }
-    setPhase(t, 'idle', '', true);
+    t.speech = ''; t.fresh = true;
+    if (t.phase === 'answer' || t.phase === 'error') { t.phase = 'idle'; t.status = ''; }
+    else setPhase(t, 'idle', '', true);
+    post(t, { session: t.id, phase: 'end', text: '', final: true });   // the turn is over (or was cancelled)
+    if (trackers.size > 50) for (const [id, x] of trackers) if (x !== t && x.fresh) { trackers.delete(id); break; }
   });
   ctx.on('agent/error', (payload) => {
     const t = forAgent(payload && payload.agent);
@@ -338,15 +348,17 @@ function recentArchives() {
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(body);
 }
 
 function readJson(req) {
   return new Promise((resolve) => {
     let buf = '';
-    req.on('data', (c) => { buf += c; });
-    req.on('end', () => { try { resolve(buf ? JSON.parse(buf) : {}); } catch { resolve({}); } });
+    req.setEncoding('utf8');
+    req.on('data', (c) => { buf += c; if (buf.length > 48 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => { try { const v = buf ? JSON.parse(buf) : {}; resolve(v && typeof v === 'object' ? v : {}); } catch { resolve({}); } });
+    req.on('close', () => resolve({}));
   });
 }
 
@@ -457,8 +469,22 @@ function apply(ctx) {
 
   // Same-origin HTTP routes for the Settings UI (client half).
   ctx.inject(['webServer'], (hostCtx) => {
-    const webServer = hostCtx.webServer;
-    if (!webServer || typeof webServer.register !== 'function') return;
+    const host = hostCtx.webServer;
+    if (!host || typeof host.register !== 'function') return;
+    // Another site open in the browser must not reach these routes: its requests are marked cross-site,
+    // and it cannot send JSON without a preflight that nobody answers.
+    const webServer = {
+      register: ({ handler, raw = false, ...r }) => host.register({
+        ...r,
+        handler: async (req, res) => {
+          const foreign = String(req.headers['sec-fetch-site'] || '') === 'cross-site';
+          const plain = req.method === 'POST' && !raw && !/^application\/json\b/i.test(String(req.headers['content-type'] || ''));
+          if (foreign || plain) { req.resume(); sendJson(res, 403, { ok: false, error: 'forbidden' }); return; }
+          try { await handler(req, res); }
+          catch (e) { if (!res.headersSent) sendJson(res, 200, { ok: false, error: String((e && e.message) || e) }); else res.destroy(); }
+        },
+      }),
+    };
 
     webServer.register({
       kind: 'exact',
@@ -542,20 +568,6 @@ function apply(ctx) {
           return;
         }
         res.writeHead(405, { allow: 'GET,POST' }); res.end();
-      },
-    });
-
-    webServer.register({
-      kind: 'exact',
-      path: '/amadeus-live2d/speak',
-      handler: async (req, res) => {
-        if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
-        const body = await readJson(req);
-        if (body && body.text) lastClientSpeakAt = Date.now();
-        logSpeak({ t: Date.now(), src: 'client', phase: body && body.phase, text: String(body && body.text || '').slice(0, 160), final: !!(body && body.final), ...(body && body.diag ? { diag: body.diag } : {}) });
-        if (body && body.diag) { sendJson(res, 200, { ok: true }); return; }
-        try { const r = await http('/speak', body); sendJson(res, 200, r); }
-        catch (e) { sendJson(res, 200, { ok: false, error: e.message }); }
       },
     });
 
@@ -648,6 +660,7 @@ function apply(ctx) {
     webServer.register({
       kind: 'exact',
       path: '/amadeus-live2d/import-upload',
+      raw: true,                                         // the archive itself is the body
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return; }
         const name = basename(String(new URL(req.url, 'http://x').searchParams.get('name') || ''));
@@ -739,7 +752,7 @@ function apply(ctx) {
       handler: (req, res) => {
         try {
           const id = decodeURIComponent(new URL(req.url, 'http://x').pathname).replace(/^\/amadeus-live2d\/preview\/?/, '');
-          if (!/^[A-Za-z0-9._-]+$/.test(id)) { res.writeHead(400); res.end(); return; }
+          if (!/^(?!\.+$)[A-Za-z0-9._-]+$/.test(id)) { res.writeHead(400); res.end(); return; }
           const rel = findPreviewHost(join(MODELS_DIR, id));
           if (!rel) { res.writeHead(404); res.end(); return; }
           const file = join(MODELS_DIR, id, rel);

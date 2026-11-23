@@ -27546,6 +27546,35 @@ function downsample(chunks, rate) {
   return result;
 }
 const special = (id2) => id2 === "default" || id2 === "communications" || !id2;
+/**
+ * How to play one synthesised sentence: the engine's own silence around it is cut off, every sentence
+ * gets the same loudness (RMS about -18 dBFS, no clipping), the pause after it depends on how it ends.
+ */
+const SPEECH_RMS = 0.125;
+function shapeSentence(buffer, text) {
+  const d = buffer.getChannelData(0), rate = buffer.sampleRate, n = d.length;
+  let peak = 0;
+  for (let i = 0; i < n; i += 2) peak = Math.max(peak, Math.abs(d[i]));
+  const threshold = Math.max(4e-3, peak * 0.03);
+  let first = 0, last = n - 1;
+  while (first < n && Math.abs(d[first]) < threshold) first++;
+  while (last > first && Math.abs(d[last]) < threshold) last--;
+  if (first >= last) return { offset: 0, duration: buffer.duration, gain: 1, pause: 0.2 };
+  let sum = 0, count = 0;
+  for (let i = first; i <= last; i += 4) {
+    if (Math.abs(d[i]) > threshold) {
+      sum += d[i] * d[i];
+      count++;
+    }
+  }
+  const rms = Math.sqrt(sum / Math.max(1, count));
+  const gain = Math.max(0.25, Math.min(4, SPEECH_RMS / Math.max(rms, 1e-4), 0.97 / Math.max(peak, 1e-4)));
+  const offset = Math.max(0, first / rate - 0.02);
+  const end = Math.min(n / rate, last / rate + 0.05);
+  const tail = String(text || "").trim();
+  const pause = /\u2026["\u00BB)]?$/.test(tail) ? 0.45 : /[?!]["\u00BB)]?$/.test(tail) ? 0.36 : /[.;]["\u00BB)]?$/.test(tail) ? 0.28 : /[,:\u2014\u2013-]$/.test(tail) ? 0.12 : 0.2;
+  return { offset, duration: Math.max(0.05, end - offset), gain, pause };
+}
 async function withSink(context, deviceId) {
   const setSink = context.setSinkId;
   if (deviceId && setSink) {
@@ -27563,12 +27592,13 @@ class Voice {
     this.recording = null;
     this.level = 0;
     this.lastError = "";
-    this.generation = 0;
+    this.epoch = 0;
+    this.pumping = -1;
+    this.fill = null;
     this.player = null;
+    this.playerIdle = 0;
     this.source = null;
-    this.queue = [];
-    this.speaking = null;
-    this.pumping = false;
+    this.lostAt = -Infinity;
   }
   get recordingNow() {
     return Boolean(this.recording && !this.recording.test);
@@ -27643,95 +27673,105 @@ class Voice {
     if (this.recordingNow) void this.stop(true);
     else void this.start();
   }
-  /** play_speech: the parts in order, the next one fetched while the current one plays. */
-  play(parts, voice, speed) {
-    this.stopSpeaking();
-    this.queue = parts.map(String).filter((part) => part.trim());
-    if (!this.queue.length) return;
-    this.speaking = { voice, speed, open: false };
-    this.pump();
+  /** There is more to say. The sentences wait in the main process; `epoch` grows whenever what is being
+   * said must stop, so a sentence of a stopped answer is never played. */
+  kick(epoch) {
+    if (epoch < this.epoch) return;
+    this.epoch = epoch;
+    if (this.pumping === epoch) this.fill?.();
+    else void this.pump(epoch);
   }
-  /** play_speech with append: more of the answer being generated, said after the queued parts.
-   * `done` closes the stream once the queued parts are spoken (no more parts are coming). */
-  append(parts, voice, speed, done) {
-    const texts = parts.map(String).filter((part) => part.trim());
-    if (!this.speaking) {
-      if (!texts.length) return;
-      this.queue.push(...texts);
-      this.speaking = { voice, speed, open: done !== true };
-      this.pump();
-      return;
-    }
-    this.speaking.voice = voice;
-    this.speaking.speed = speed;
-    this.speaking.open = done !== true;
-    if (texts.length) this.queue.push(...texts);
-    this.pump();
-  }
-  /** Says the queue in order and waits for more while the answer is still coming. */
-  pump() {
-    if (this.pumping) return;
-    this.pumping = true;
-    const generation = this.generation;
-    void (async () => {
-      const context = new AudioContext();
-      this.player = context;
-      await withSink(context, this.devicesSetting().outputDeviceId);
-      let carried = null;
-      try {
-        while (generation === this.generation) {
-          const text = this.queue[0];
-          if (!text) {
-            if (!this.speaking?.open) break;
-            await new Promise((resolve) => setTimeout(resolve, 80));
-            continue;
-          }
-          this.queue.shift();
-          const setting = this.speaking ?? { voice: "sveta", speed: 1, open: false };
-          const result = carried && carried.text === text ? carried.audio : this.api.synthesize({ text, voice: setting.voice, speed: setting.speed });
-          carried = null;
-          const head = this.queue[0];
-          if (head) carried = { text: head, audio: this.api.synthesize({ text: head, voice: setting.voice, speed: setting.speed }) };
-          const spoken = await result;
-          if (generation !== this.generation) return;
-          if ("error" in spoken) {
-            console.error("[voice] synthesize:", spoken.error);
-            continue;
-          }
-          try {
-            const buffer = await context.decodeAudioData(spoken.audio);
-            if (generation !== this.generation) return;
-            await new Promise((resolve) => {
-              const source = context.createBufferSource();
-              source.buffer = buffer;
-              source.connect(context.destination);
-              source.onended = () => resolve();
-              this.source = source;
-              source.start();
-            });
-          } catch (error) {
-            console.error("[voice] playback:", error);
-          }
-        }
-      } finally {
-        this.pumping = false;
-        if (generation === this.generation) this.stopSpeaking();
+  /** Says one sentence after another; the next one is fetched while the current one plays. */
+  async pump(epoch) {
+    this.pumping = epoch;
+    const ahead = [];
+    this.fill = () => {
+      while (epoch === this.epoch && ahead.length < 2) {
+        const item = {};
+        item.result = this.api.nextSpeech(epoch).catch((error) => ({ ok: false, error: String(error) })).then((result) => {
+          if (!result && ahead.includes(item)) ahead.splice(ahead.indexOf(item), 1);
+          return result;
+        });
+        ahead.push(item);
       }
-    })();
+    };
+    this.fill();
+    let pauseUntil = 0;
+    while (epoch === this.epoch) {
+      const item = ahead.shift();
+      if (!item) break;
+      const spoken = await item.result;
+      if (epoch !== this.epoch) return;
+      if (!spoken) continue;
+      this.fill();
+      if (!spoken.ok) {
+        console.error("[voice] synthesize:", spoken.error);
+        if (performance.now() - this.lostAt > 6e4 && !this.recording) {
+          this.lostAt = performance.now();
+          this.onState("idle", "\u{1F507} Голос не ответил — фраза пропущена.");
+        }
+        continue;
+      }
+      try {
+        const context = await this.output();
+        const buffer = await context.decodeAudioData(spoken.audio);
+        const shape = shapeSentence(buffer, spoken.text);
+        const wait = pauseUntil - performance.now();
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+        if (epoch !== this.epoch) return;
+        await new Promise((resolve) => {
+          const source = context.createBufferSource();
+          const gain = context.createGain();
+          gain.gain.value = shape.gain;
+          source.buffer = buffer;
+          source.connect(gain);
+          gain.connect(context.destination);
+          source.onended = () => resolve();
+          this.source = source;
+          source.start(0, shape.offset, shape.duration);
+        });
+        pauseUntil = performance.now() + shape.pause * 1e3;
+      } catch (error) {
+        console.error("[voice] playback:", error);
+      }
+    }
+    if (epoch !== this.epoch) return;
+    this.pumping = -1;
+    this.fill = null;
+    this.source = null;
+    clearTimeout(this.playerIdle);
+    this.playerIdle = window.setTimeout(() => {
+      if (this.pumping < 0) void this.player?.suspend().catch(() => {
+      });
+    }, 2e4);
   }
-  stopSpeaking() {
-    this.generation++;
-    this.queue = [];
-    if (this.speaking) this.speaking.open = false;
-    this.speaking = null;
+  /** The chosen output device, awake. */
+  async output() {
+    clearTimeout(this.playerIdle);
+    if (!this.player) this.player = new AudioContext();
+    const sink = this.devicesSetting().outputDeviceId;
+    if (sink !== this.sink) {
+      this.sink = sink;
+      await withSink(this.player, sink);
+    }
+    if (this.player.state === "suspended") await this.player.resume();
+    return this.player;
+  }
+  /** Stops the sentence being said; what is queued is the main process's business. */
+  silence(epoch) {
+    this.epoch = Math.max(this.epoch, epoch);
+    this.pumping = -1;
+    this.fill = null;
     try {
       this.source?.stop();
     } catch {
     }
     this.source = null;
-    void this.player?.close().catch(() => {
-    });
-    this.player = null;
+  }
+  /** Silence everything that is said or waiting (the user speaks now, or the window closes). */
+  stopSpeaking() {
+    this.silence(this.epoch + 1);
+    this.api.hushSpeech();
   }
   // --- The core's audio requests (settings page) ----------------------------------------------
   async audio(action, args) {
@@ -27806,13 +27846,6 @@ const SCALE_MS = 320;
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
-const DEFAULT_STYLE = {
-  fontFamily: "Segoe UI",
-  fontSize: 16,
-  fontColor: "#f2f2f2",
-  backgroundColor: "#202023",
-  opacity: 0.92
-};
 class Stage {
   constructor(canvas, api, onVoice, onError) {
     this.canvas = canvas;
@@ -27840,6 +27873,10 @@ class Stage {
     this.pushToTalk = false;
     this.lastPosition = { x: NaN, y: NaN };
     this.frameHandle = 0;
+    this.frameTimer = 0;
+    this.hidden = false;
+    this.resting = false;
+    this.contextLost = false;
     this.cursorTimer = 0;
     this.poseTimer = 0;
     this.poseGeneration = 0;
@@ -27883,8 +27920,20 @@ class Stage {
     this.onContextMenu = (event) => {
       event.preventDefault();
     };
+    // Frames only while she can be seen; at rest half of them are not even asked for.
+    this.schedule = (resting) => {
+      if (this.stopped || this.hidden || this.frameHandle || this.frameTimer) return;
+      const ask = () => {
+        this.frameTimer = 0;
+        this.frameHandle = requestAnimationFrame(this.frame);
+      };
+      if (resting) this.frameTimer = window.setTimeout(ask, 20);
+      else ask();
+    };
     this.frame = (time) => {
-      this.frameHandle = requestAnimationFrame(this.frame);
+      this.frameHandle = 0;
+      if (this.hidden) return;
+      this.schedule(this.resting);
       const behavior = this.behavior;
       const character = this.character;
       if (!behavior || !character) return;
@@ -27893,6 +27942,7 @@ class Stage {
       const scaling = this.animateScale(time);
       this.pending += seconds;
       const resting = !scaling && behavior.mode === "idle" && !this.hovering && !this.pushToTalk;
+      this.resting = resting;
       if (this.pending < (resting ? IDLE_FRAME : ACTIVE_FRAME) - 2e-3) return;
       const step = Math.min(this.pending, 0.1);
       this.pending = 0;
@@ -27941,9 +27991,9 @@ class Stage {
         }
       }),
       this.api.onSettings((settings2) => void this.applySettings(settings2)),
-      // The menu's size slider moves the figure live; only the resting value is saved.
-      this.api.onScalePreview((scale) => this.askScale(clamp(scale, 0.5, 2))),
       this.api.onVoiceToggle(() => this.voice.toggle()),
+      this.api.onVoiceKick((epoch) => this.voice.kick(epoch)),
+      this.api.onVoiceStop((epoch) => this.voice.silence(epoch)),
       this.api.onAudio((id2, action, args) => {
         this.voice.audio(action, args).then(
           (result) => this.api.answerAudio(id2, { result }),
@@ -27955,14 +28005,23 @@ class Stage {
       })
     );
     window.addEventListener("resize", this.resizeCanvas);
+    this.canvas.addEventListener("webglcontextlost", (event) => {
+      event.preventDefault();
+      if (this.contextLost || this.stopped) return;
+      this.contextLost = true;
+      this.api.gpuLost();
+    });
     this.canvas.addEventListener("pointerdown", this.onPointerDown);
     this.canvas.addEventListener("pointermove", this.onPointerMove);
     this.canvas.addEventListener("pointerup", this.onPointerUp);
     this.canvas.addEventListener("contextmenu", this.onContextMenu);
+    let skipped = false;
     this.cursorTimer = window.setInterval(() => {
-      void this.pollCursor();
+      if (this.hidden) return;
+      skipped = this.resting && !skipped;
+      if (!skipped) void this.pollCursor();
     }, 16);
-    this.frameHandle = requestAnimationFrame(this.frame);
+    this.schedule(false);
     const settings = await this.api.settings();
     if (settings && !this.settings) await this.applySettings(settings);
   }
@@ -27970,6 +28029,7 @@ class Stage {
     this.stopped = true;
     this.cancelPoseTimer();
     cancelAnimationFrame(this.frameHandle);
+    clearTimeout(this.frameTimer);
     clearInterval(this.cursorTimer);
     window.removeEventListener("resize", this.resizeCanvas);
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -27989,6 +28049,21 @@ class Stage {
   }
   async applySettings(settings) {
     this.settings = settings;
+    const hidden = settings.hidden === true;
+    if (hidden !== this.hidden) {
+      this.hidden = hidden;
+      this.lastFrame = 0;
+      if (hidden) {
+        cancelAnimationFrame(this.frameHandle);
+        clearTimeout(this.frameTimer);
+        this.frameHandle = this.frameTimer = 0;
+        if (this.interactive) {
+          this.interactive = false;
+          this.api.setInteractive(false);
+        }
+        void this.voice.stop(false);
+      } else this.schedule(false);
+    }
     if (settings.behaviors) {
       for (const [name, enabled] of Object.entries(settings.behaviors)) {
         this.behaviors[name] = enabled;
@@ -28015,7 +28090,7 @@ class Stage {
     }
     try {
       const url = await this.api.modelUrl(modelId);
-      if (!url) return { ok: false, error: "Файл модели Live2D не найден." };
+      if (!url) return { ok: false, failed: true, error: "Файл модели Live2D не найден." };
       const character = await Live2DCharacter.load(this.gl, url, this.canvas.width, this.canvas.height);
       if (this.stopped || modelId !== this.modelId) {
         character.dispose();
@@ -28033,7 +28108,7 @@ class Stage {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`model ${modelId}: ${message}`);
       this.onError(`Не удалось открыть модель: ${message}`);
-      return { ok: false, error: "Не удалось открыть выбранную модель Live2D." };
+      return { ok: false, failed: true, error: "Не удалось открыть выбранную модель Live2D." };
     }
   }
   /** A model without a catalog preview (imported while no window was open) gets one once shown. */
@@ -28121,14 +28196,6 @@ class Stage {
           }
         };
       }
-      case "play_speech": {
-        const parts = Array.isArray(args.parts) ? args.parts.map(String) : [];
-        const voice = String(args.voice ?? "sveta");
-        const speed = Number(args.speed) || 1;
-        if (args.append === true) this.voice.append(parts, voice, speed, args.final === true);
-        else this.voice.play(parts, voice, speed);
-        return { ok: true };
-      }
     }
     await this.loading;
     const character = this.character;
@@ -28136,15 +28203,6 @@ class Stage {
       return { ok: false, error: "Эта модель сейчас не открыта в окне персонажа." };
     }
     switch (command.name) {
-      case "show_speech":
-        this.api.speak({
-          text: String(args.text ?? ""),
-          final: Boolean(args.final),
-          phase: String(args.phase ?? "answer"),
-          status: String(args.status ?? ""),
-          style: { ...DEFAULT_STYLE, ...this.settings?.speechBubble ?? {} }
-        });
-        return { ok: true };
       case "play_motion": {
         const group = String(args.group ?? "");
         const index = Number(args.index);

@@ -1,9 +1,9 @@
-"""Local speech-to-text for the 3D companion (faster-whisper, CPU int8).
+"""Local speech-to-text for the companions (faster-whisper, CPU int8).
 
     python stt_server.py <port> <models_dir>
 
 GET  /health      -> {"ok": true, "ready": bool}
-POST /transcribe  (body: 16 kHz mono WAV) -> {"ok": true, "text": "..."}
+POST /transcribe  (body: WAV, or any recording PyAV can read: webm, ogg, mp4) -> {"ok": true, "text": "..."}
 
 The model loads in the background on start, so the first phrase does not wait for it.
 """
@@ -34,8 +34,20 @@ def load():
         state['error'] = str(e)
 
 
-def transcribe(wav_bytes, hint):
-    with wave.open(io.BytesIO(wav_bytes)) as w:
+def decode(data):
+    """16 kHz mono float samples of a recording."""
+    if data[:4] != b'RIFF':
+        import av                                                    # not decode_audio(): it does not fit every PyAV
+        out = []
+        with av.open(io.BytesIO(data)) as box:
+            to16k = av.AudioResampler(format='s16', layout='mono', rate=16000)
+            for frame in box.decode(audio=0):
+                out += [f.to_ndarray().reshape(-1) for f in to16k.resample(frame)]
+            out += [f.to_ndarray().reshape(-1) for f in to16k.resample(None)]
+        if not out:
+            raise ValueError('В записи нет звука.')
+        return np.concatenate(out).astype(np.float32) / 32768.0
+    with wave.open(io.BytesIO(data)) as w:
         rate, n, ch = w.getframerate(), w.getnframes(), w.getnchannels()
         pcm = np.frombuffer(w.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
     if ch > 1:
@@ -43,6 +55,11 @@ def transcribe(wav_bytes, hint):
     if rate != 16000:
         idx = np.linspace(0, len(pcm) - 1, int(len(pcm) * 16000 / rate))
         pcm = np.interp(idx, np.arange(len(pcm)), pcm).astype(np.float32)
+    return pcm
+
+
+def transcribe(data, hint):
+    pcm = decode(data)
     with lock:
         segs, _ = state['model'].transcribe(pcm, language='ru', beam_size=1, vad_filter=True,
                                             initial_prompt=hint or None, condition_on_previous_text=False)
@@ -95,4 +112,5 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     threading.Thread(target=load, daemon=True).start()
+    ThreadingHTTPServer.allow_reuse_address = False              # Windows would let two servers share the port
     ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()

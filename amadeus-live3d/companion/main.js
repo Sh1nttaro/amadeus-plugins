@@ -251,7 +251,7 @@ async function edgeSynthesize(text, voice, rate, pitch) {
   const res = await fetch(`http://127.0.0.1:${EDGE_PORT}/synthesize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ text, voice: EDGE_VOICES.includes(voice) ? voice : EDGE_VOICES[0], rate: clamp(Number(rate) || 0, -50, 50), pitch: clamp(Number(pitch) || 0, -50, 50) }),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(100000),
   });
   if (res.ok) return await res.arrayBuffer();
   const error = await res.json().catch(() => ({}));
@@ -313,7 +313,7 @@ async function transcribe(dataB64, type, filename) {
   const apiKey = process.env.LITELLM_API_KEY || '';
   const buf = Buffer.from(dataB64, 'base64');
   if (buf.length < 1000) return { ok: false, error: 'Аудио слишком короткое.' };
-  if (!baseUrl) return /wav/.test(String(type || 'wav')) ? transcribeLocal(buf) : { ok: false, error: 'Укажите адрес сервера распознавания в настройках «Слушать».' };
+  if (!baseUrl) return transcribeLocal(buf);
   const mime = typeof type === 'string' && type ? type : 'audio/wav';
   const fd = new FormData();
   fd.append('model', 'groq/whisper-large-v3-turbo');

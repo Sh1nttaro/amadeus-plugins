@@ -5,26 +5,28 @@
 //   POST /command      { name, args }   -> { ok, result } | { ok:false, error }
 //   POST /load_model   { id }           -> { ok, result } | { ok:false, error }
 //   GET  /list_models                   -> { ok, models:[...] }
-//   POST /speak        { text }         -> { ok, result }
+//   POST /speak        { session, text, phase, final, turn } -> { ok }
 //   POST /wait_ready   { timeoutMs }    -> { ok, result }
 //   GET  /ping                          -> { ok:true, pong:true }
 //   POST /shutdown                      -> { ok:true }
+// Every request carries the token of the plugin that started us (AMADEUS_TOKEN), see allowed().
 'use strict';
 
 const { app, BrowserWindow, ipcMain, protocol, screen, dialog } = require('electron');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes, timingSafeEqual } = require('crypto');
 const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
 const importer = require('./importer');
+const { Speech } = require('./speech-text');
 
 const RENDERER_DIR = path.join(__dirname, 'renderer');
 const MODELS_DIR = path.join(__dirname, 'models');
 const PRELOAD = path.join(__dirname, 'preload', 'index.js');
 const SCHEME = 'amadeus-model';
-const MODEL_ID = /^[A-Za-z0-9._-]+$/;
+const MODEL_ID = /^(?!\.+$)[A-Za-z0-9._-]+$/;                 // not "." / "..": those are the folder itself and its parent
 const LIVE2D_BUBBLE_SIZE = { width: 330, height: 300 };
 // How far the bubble reaches into the character window (the figure is narrower than its window).
 const LIVE2D_BUBBLE_OVERLAP = 0.2;
@@ -35,12 +37,43 @@ let lastBubblePhase = '';
 protocol.registerSchemesAsPrivileged([
   { scheme: SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true, bypassCSP: true } },
 ]);
-// Software SwiftShader is the DEFAULT: it is the only config PROVEN to load the Live2D
-// model in this transparent sidecar window (hardware WebGL still hangs during the
-// synchronous texture upload). Opt out via AMADEUS_LIVE2D_SWIFTSHADER=0.
-if (process.env.AMADEUS_LIVE2D_SWIFTSHADER !== '0') {
+// Rendering: the GPU, and the software renderer (SwiftShader: works everywhere, but costs two CPU cores)
+// when the GPU has let us down twice. AMADEUS_LIVE2D_SWIFTSHADER=1 forces software, =0 forces the GPU.
+const GPU_FILE = path.join(__dirname, 'gpu.json');
+const GPU_RETRY_MS = 7 * 24 * 3600 * 1000;                        // a driver update may have helped: one more try a week
+const EXIT_SOFTWARE = 75;                                        // tells the plugin: start me again, now in software
+function readGpu() {
+  try { const g = JSON.parse(fs.readFileSync(GPU_FILE, 'utf8')); return { fails: Number(g.fails) || 0, at: Number(g.at) || 0, loading: g.loading === true }; } catch { return { fails: 0, at: 0, loading: false }; }
+}
+function writeGpu(g) { try { fs.writeFileSync(GPU_FILE, JSON.stringify(g)); } catch {} }
+/** The software renderer is needed: asked for, or two failures on the GPU lately. */
+function wantSoftware(env, g, now) {
+  if (env === '1') return true;
+  if (env === '0') return false;
+  return g.fails >= 2 && now - g.at < GPU_RETRY_MS;
+}
+let gpu = readGpu();
+if (gpu.loading) { gpu = { fails: gpu.fails + 1, at: Date.now(), loading: false }; writeGpu(gpu); }   // the last start died while a model was loading
+const software = wantSoftware(process.env.AMADEUS_LIVE2D_SWIFTSHADER, gpu, Date.now());
+if (software) {
   app.commandLine.appendSwitch('enable-unsafe-swiftshader');
   app.disableHardwareAcceleration();
+} else {
+  app.commandLine.appendSwitch('ignore-gpu-blocklist');
+}
+function gpuLoading(on, ok) {
+  if (software || (gpu.loading === on && !ok)) return;
+  gpu = ok ? { fails: 0, at: 0, loading: false } : { ...gpu, loading: on };
+  writeGpu(gpu);
+}
+/** The GPU froze or kept losing the picture: leave, and the plugin starts us again in software. */
+function gpuFailed(reason) {
+  if (software || process.env.AMADEUS_LIVE2D_SWIFTSHADER === '0') return;
+  process.stderr.write(`[live2d] GPU rendering failed (${reason}), switching to software\n`);
+  gpu = { fails: Math.max(2, gpu.fails + 1), at: Date.now(), loading: false };
+  writeGpu(gpu);
+  stopServers();
+  app.exit(EXIT_SOFTWARE);
 }
 
 let character = null;
@@ -49,13 +82,16 @@ let menu = null;
 let activeModelId = '';
 let behaviors = { wander: true, perch: true, cursor: true };
 let hidden = false;
-let voiceReplies = { enabled: false, voice: 'sveta', speed: 1, engine: 'edge', edgeVoice: 'ru-RU-SvetlanaNeural', edgeRate: 10, edgePitch: 15 };
+let voiceReplies = { enabled: false, voice: 'sveta', speed: 1, engine: 'edge', edgeVoice: 'en-US-AvaMultilingualNeural', edgeRate: 10, edgePitch: 15 };
 function voiceExtras(src, dst) {                                // engine and the Edge voice settings
   if (src.engine === 'edge' || src.engine === 'kokoro') dst.engine = src.engine;
   if (typeof src.edgeVoice === 'string' && /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(src.edgeVoice)) dst.edgeVoice = src.edgeVoice;
   for (const k of ['edgeRate', 'edgePitch']) if (typeof src[k] === 'number' && isFinite(src[k])) dst[k] = Math.min(50, Math.max(-50, Math.round(src[k])));
 }
-const VOICES = ['sveta', 'masha', 'dima'];
+const BUILTIN_VOICES = ['sveta', 'masha', 'dima'];
+const VOICE_NAME = /^[a-z0-9_-]{1,40}$/;
+let sttUrl = '';                                                 // the user's own OpenAI-compatible Whisper server ('' = recognise here)
+const STT_URL = /^https?:\/\/[^\s]{3,300}$/;
 let modelScale = 1.0;
 let hotkeys = { microphoneToggle: 'CTRL+ALT+M', curtainToggle: 'CTRL+ALT+H', radioEnabled: false, pushToTalk: 'MOUSE4' };
 let voiceDevices = { inputDeviceId: '', outputDeviceId: '', inputVolume: 100, outputVolume: 70 };
@@ -82,7 +118,16 @@ function sanitizeOrbLook(value) {
   return out;
 }
 let menuOffset = null; // DIP offset from the character window's top-left, recorded at menu-open time.
-const pendingChat = []; // text queued for the DSH web app to inject into its composer.
+const pendingChat = [];                                          // { at, text } for the DSH web app's chat
+const PHRASE_TTL = 120000;                                       // a phrase nobody fetched in time is not sent later
+function pushChat(text) { pendingChat.push({ at: Date.now(), text }); }
+function nextChat() {
+  for (;;) {
+    const m = pendingChat.shift();
+    if (!m) return '';
+    if (Date.now() - m.at < PHRASE_TTL) return m.text;
+  }
+}
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 function loadPersisted() {
   try {
@@ -97,10 +142,11 @@ function loadPersisted() {
       }
       if (data.voiceReplies && typeof data.voiceReplies === 'object') {
         if (typeof data.voiceReplies.enabled === 'boolean') voiceReplies.enabled = data.voiceReplies.enabled;
-        if (typeof data.voiceReplies.voice === 'string' && VOICES.includes(data.voiceReplies.voice)) voiceReplies.voice = data.voiceReplies.voice;
+        if (typeof data.voiceReplies.voice === 'string' && VOICE_NAME.test(data.voiceReplies.voice)) voiceReplies.voice = data.voiceReplies.voice;
         if (typeof data.voiceReplies.speed === 'number' && isFinite(data.voiceReplies.speed)) voiceReplies.speed = data.voiceReplies.speed;
         voiceExtras(data.voiceReplies, voiceReplies);
       }
+      if (typeof data.sttUrl === 'string' && STT_URL.test(data.sttUrl)) sttUrl = data.sttUrl;
       if (typeof data.modelScale === 'number' && isFinite(data.modelScale) && data.modelScale >= 0.2 && data.modelScale <= 3) modelScale = data.modelScale;
       if (data.hotkeys && typeof data.hotkeys === 'object') {
         if (typeof data.hotkeys.radioEnabled === 'boolean') hotkeys.radioEnabled = data.hotkeys.radioEnabled;
@@ -124,7 +170,7 @@ function loadPersisted() {
 }
 function persist() {
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ activeModelId, hidden, behaviors, voiceReplies, modelScale, hotkeys, voiceDevices, speechBubble }, null, 2));
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ activeModelId, hidden, behaviors, voiceReplies, modelScale, hotkeys, voiceDevices, speechBubble, sttUrl }, null, 2));
   } catch {}
 }
 loadPersisted();
@@ -137,32 +183,46 @@ function runtimePython(name) {
   const py = runtimePath('python', name, 'Scripts', 'python.exe');
   return fs.existsSync(py) ? py : null;
 }
+/** Environment of the local voice / recognition servers: they never need the user's API key or our token. */
+const childEnv = () => { const e = { ...process.env, AMADEUS_RUNTIME: RUNTIME }; delete e.LITELLM_API_KEY; delete e.AMADEUS_TOKEN; return e; };
+
+// ---- Kokoro-ru (companion/speech): shared with live3D on port 58321, reused when it is already running
+const KOKORO_PORT = 58321;
 let kokoroProcess = null;
-let kokoroPort = null;
 function kokoroPython() { return runtimePython('kokoro') || 'python.exe'; }
 const kokoroVoicesDir = () => runtimePath('models', 'speech', 'kokoro-ru', 'voices');   // the style .bin files the server reads
+function kokoroVoices() {
+  const out = [...BUILTIN_VOICES];
+  try {
+    for (const f of fs.readdirSync(kokoroVoicesDir())) {
+      const n = f.replace(/\.bin$/i, '');
+      if (/\.bin$/i.test(f) && !out.includes(n)) out.push(n);
+    }
+  } catch {}
+  return out;
+}
+async function kokoroHealthy() {
+  try { const r = await fetch(`http://127.0.0.1:${KOKORO_PORT}/health`, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
+}
+let kokoroStarting = null;
 async function kokoroEnsure() {
-  if (kokoroProcess && kokoroPort) {
-    if (kokoroProcess.exitCode === null) return kokoroPort;
-    kokoroProcess = null; kokoroPort = null;
+  if (await kokoroHealthy()) return KOKORO_PORT;
+  if (!kokoroStarting) {
+    kokoroStarting = (async () => {
+      if (!kokoroProcess || kokoroProcess.exitCode !== null) {
+        kokoroProcess = spawn(kokoroPython(), ['-m', 'speech.server', String(KOKORO_PORT)], { cwd: __dirname, env: childEnv(), stdio: 'ignore', windowsHide: true });
+        kokoroProcess.on('error', () => {});
+      }
+      const deadline = Date.now() + 25000;
+      while (Date.now() < deadline) {
+        if (await kokoroHealthy()) return true;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      return false;
+    })().finally(() => { kokoroStarting = null; });
   }
-  const port = 58321;
-  const child = spawn(kokoroPython(), ['-m', 'speech.server', String(port)], {
-    cwd: __dirname, env: { ...process.env, AMADEUS_RUNTIME: RUNTIME }, stdio: 'ignore', windowsHide: true,
-  });
-  kokoroProcess = child;
-  child.on('exit', () => { if (kokoroProcess === child) { kokoroProcess = null; kokoroPort = null; } });
-  child.on('error', () => { if (kokoroProcess === child) { kokoroProcess = null; kokoroPort = null; } });
-  const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1000) });
-      if (res.ok) { kokoroPort = port; return port; }
-    } catch {}
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  kokoroPort = port;
-  return port;
+  if (!(await kokoroStarting)) throw new Error('Kokoro не запустился');
+  return KOKORO_PORT;
 }
 // ---- Edge neural voices (online): the same small edge-tts server as live3D (shared port)
 const EDGE_PORT = 58323;
@@ -180,7 +240,7 @@ async function edgeEnsure() {
       if (!edgeProcess || edgeProcess.exitCode !== null) {
         const py = edgePython();
         if (!py) return false;
-        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { stdio: 'ignore', windowsHide: true });
+        edgeProcess = spawn(py, [path.join(__dirname, 'tts_edge_server.py'), String(EDGE_PORT)], { env: childEnv(), stdio: 'ignore', windowsHide: true });
         edgeProcess.on('error', () => {});
       }
       const deadline = Date.now() + 15000;
@@ -190,21 +250,24 @@ async function edgeEnsure() {
   }
   return edgeStarting;
 }
-app.on('will-quit', () => { try { if (edgeProcess && edgeProcess.exitCode === null) edgeProcess.kill(); } catch {} });
+function stopServers() {
+  for (const p of [kokoroProcess, edgeProcess, sttProcess]) { try { if (p && p.exitCode === null) p.kill(); } catch {} }
+}
+app.on('will-quit', () => { stopServers(); gpuLoading(false); });
 async function edgeSynthesize(text) {
-  if (!(await edgeEnsure())) throw new Error('Edge-голоса недоступны.');
+  if (!(await edgeEnsure())) throw new Error(`Edge-голоса недоступны (нет окружения ${runtimePath('python', 'tts')}; запустите setup\\install-runtime.ps1).`);
   const lim = (v, d) => Math.min(50, Math.max(-50, Math.round(Number.isFinite(Number(v)) ? Number(v) : d)));
   const res = await fetch(`http://127.0.0.1:${EDGE_PORT}/synthesize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ text, voice: EDGE_VOICES.includes(voiceReplies.edgeVoice) ? voiceReplies.edgeVoice : EDGE_VOICES[0], rate: lim(voiceReplies.edgeRate, 10), pitch: lim(voiceReplies.edgePitch, 15) }),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(100000),
   });
   if (res.ok) return await res.arrayBuffer();
   const error = await res.json().catch(() => ({}));
   throw new Error(error.error || `edge http ${res.status}`);
 }
 async function kokoroSynthesize(text, voice, speed) {
-  const wanted = VOICES.includes(voice) ? voice : 'sveta';
+  const wanted = kokoroVoices().includes(voice) ? voice : 'sveta';
   const rate = Math.min(2, Math.max(0.5, Number(speed) || 1));
   const port = await kokoroEnsure();
   const res = await fetch(`http://127.0.0.1:${port}/synthesize`, {
@@ -219,11 +282,41 @@ async function kokoroSynthesize(text, voice, speed) {
 }
 const pending = new Map(); // commandId -> { resolve, t }
 function dlog(_s) {}
+// ---- what she says: the sentences wait here, the character window asks for the next one when it is ready.
+const toCharacter = (...a) => { if (character && !character.isDestroyed() && !character.webContents.isDestroyed()) character.webContents.send(...a); };
+const speech = new Speech({ onStop: (epoch) => toCharacter('voice:stop', epoch), onKick: (epoch) => toCharacter('voice:kick', epoch) });
+const aloud = () => voiceReplies.enabled && !hidden;              // a hidden live2D must not read answers on top of the 3D companion
+let voiceError = null;                                           // { engine, error, at }: the last sentence that could not be said
+/** Only the chosen engine, never another voice; a sentence that fails is skipped. */
+async function synthesize(text) {
+  const engine = voiceReplies.engine === 'kokoro' ? 'kokoro' : 'edge';
+  try {
+    let audio;
+    if (engine === 'edge') audio = await edgeSynthesize(text);   // the server retries by itself
+    else {
+      try { audio = await kokoroSynthesize(text, voiceReplies.voice, voiceReplies.speed); }
+      catch { audio = await kokoroSynthesize(text, voiceReplies.voice, voiceReplies.speed); }
+    }
+    voiceError = null;
+    return { ok: true, text, audio };
+  } catch (error) {
+    voiceError = { engine, error: String((error && error.message) || error).slice(0, 240), at: Date.now() };
+    process.stderr.write(`[live2d] voice ${engine}: ${voiceError.error}\n`);
+    return { ok: false, text, error: voiceError.error };
+  }
+}
+/** Everything that is on screen or being said goes away with the character. */
+function quiet() {
+  speech.hush();
+  if (bubble && !bubble.isDestroyed()) bubble.hide();
+  if (menu && !menu.isDestroyed()) menu.hide();
+}
 function settings() {
   const models = {};
   for (const id of listModels()) models[id] = true;
   return {
     activeModelId,
+    hidden,
     modelScale,
     voiceReplies: { ...voiceReplies },
     catalogState: { models },
@@ -234,15 +327,19 @@ function settings() {
   };
 }
 
+/** The settings page's view. */
+function publicSettings() {
+  return { ok: true, behaviors: { ...behaviors }, hidden, voiceReplies: { ...voiceReplies }, voices: kokoroVoices(), modelScale, hotkeys: { ...hotkeys }, voiceDevices: { ...voiceDevices }, speechBubble: { ...speechBubble }, sttUrl, voiceError, rendering: software ? 'cpu' : 'gpu' };
+}
 // Apply a partial settings patch { hidden?, behaviors?: { wander?, perch?, cursor? } }.
 // Returns the new state; forwards behaviors to the renderer via link:settings.
 function applySettingsPatch(patch) {
-  if (!patch || typeof patch !== 'object') return { ok: true, behaviors: { ...behaviors }, hidden };
+  if (!patch || typeof patch !== 'object') return publicSettings();
   let changed = false;
   if (typeof patch.hidden === 'boolean' && patch.hidden !== hidden) {
     hidden = patch.hidden;
     if (character && !character.isDestroyed()) {
-      if (hidden) character.hide();
+      if (hidden) { character.hide(); quiet(); }
       else if (!character.isVisible()) character.showInactive();
     }
     changed = true;
@@ -258,9 +355,10 @@ function applySettingsPatch(patch) {
   if (patch.voiceReplies && typeof patch.voiceReplies === 'object') {
     if (typeof patch.voiceReplies.enabled === 'boolean' && patch.voiceReplies.enabled !== voiceReplies.enabled) {
       voiceReplies.enabled = patch.voiceReplies.enabled;
+      if (!voiceReplies.enabled) speech.hush();
       changed = true;
     }
-    if (typeof patch.voiceReplies.voice === 'string' && VOICES.includes(patch.voiceReplies.voice) && patch.voiceReplies.voice !== voiceReplies.voice) {
+    if (typeof patch.voiceReplies.voice === 'string' && kokoroVoices().includes(patch.voiceReplies.voice) && patch.voiceReplies.voice !== voiceReplies.voice) {
       voiceReplies.voice = patch.voiceReplies.voice;
       changed = true;
     }
@@ -271,6 +369,10 @@ function applySettingsPatch(patch) {
     const before = JSON.stringify(voiceReplies);
     voiceExtras(patch.voiceReplies, voiceReplies);
     if (JSON.stringify(voiceReplies) !== before) changed = true;
+  }
+  if (typeof patch.sttUrl === 'string' && (patch.sttUrl === '' || STT_URL.test(patch.sttUrl)) && patch.sttUrl.replace(/\/+$/, '') !== sttUrl) {
+    sttUrl = patch.sttUrl.replace(/\/+$/, '');
+    changed = true;
   }
   if (typeof patch.scale === 'number' && isFinite(patch.scale) && patch.scale >= 0.2 && patch.scale <= 3 && Math.abs(patch.scale - modelScale) > 0.0001) {
     modelScale = patch.scale;
@@ -291,6 +393,7 @@ function applySettingsPatch(patch) {
   if (patch.speechBubble && typeof patch.speechBubble === 'object') {
     if (typeof patch.speechBubble.enabled === 'boolean' && patch.speechBubble.enabled !== speechBubble.enabled) {
       speechBubble.enabled = patch.speechBubble.enabled;
+      if (!speechBubble.enabled && bubble && !bubble.isDestroyed()) bubble.hide();
       changed = true;
     }
     if ((patch.speechBubble.mode === 'orb' || patch.speechBubble.mode === 'bubble') && patch.speechBubble.mode !== speechBubble.mode) {
@@ -322,52 +425,74 @@ function applySettingsPatch(patch) {
   }
   if (changed) {
     persist();
-    if (character && !character.webContents.isDestroyed()) character.webContents.send('link:settings', settings());
+    toCharacter('link:settings', settings());
   }
-  return { ok: true, behaviors: { ...behaviors }, hidden, voiceReplies: { ...voiceReplies }, voices: VOICES.slice(), modelScale, hotkeys: { ...hotkeys }, voiceDevices: { ...voiceDevices }, speechBubble: { ...speechBubble } };
+  return publicSettings();
 }
 
 async function importVoice(body) {
-  const name = String(body && body.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
-  const data = body && body.data;
-  if (!name || !data) return { ok: false, error: 'Нужны имя и файл .bin.' };
-  if (['sveta', 'masha', 'dima'].includes(name)) return { ok: false, error: 'Это имя занято встроенным голосом.' };
-  const buf = Buffer.from(data, 'base64');
-  if (buf.length < 1000) return { ok: false, error: 'Файл слишком маленький (ожидается .bin со стилем голоса).' };
+  const name = String((body && body.name) || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
+  if (!name || typeof body.data !== 'string') return { ok: false, error: 'Нужны имя и файл .bin.' };
+  if (BUILTIN_VOICES.includes(name)) return { ok: false, error: 'Имя «' + name + '» занято встроенным голосом — переименуйте файл.' };
+  const buf = Buffer.from(body.data, 'base64');
+  if (buf.length < 1024 * 64 || buf.length % 1024) return { ok: false, error: 'Это не стиль голоса Kokoro (.bin из строк по 256 чисел float32).' };
   const voicesDir = kokoroVoicesDir();
   fs.mkdirSync(voicesDir, { recursive: true });
   fs.writeFileSync(path.join(voicesDir, name + '.bin'), buf);
-  const port = await kokoroEnsure();
-  const res = await fetch(`http://127.0.0.1:${port}/voices`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name }),
-    signal: AbortSignal.timeout(30000),
-  });
-  const r = await res.json().catch(() => ({}));
-  if (!res.ok && !r.ok) return { ok: false, error: (r && r.error) || `voices http ${res.status}` };
-  if (!VOICES.includes(name)) VOICES.push(name);
-  if (!voiceReplies.voice || !VOICES.includes(voiceReplies.voice)) voiceReplies.voice = name;
-  return { ok: true, name, voices: VOICES.slice() };
+  try {
+    if (await kokoroHealthy()) await fetch(`http://127.0.0.1:${KOKORO_PORT}/voices`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }), signal: AbortSignal.timeout(30000) });
+  } catch {}
+  return { ok: true, name, voices: kokoroVoices() };
 }
 
+// ---- recognition: the user's own Whisper server when its address is set, the local faster-whisper otherwise.
+// The recording and the key go to that address and nowhere else.
+const STT_PORT = 58322;
+const STT_HINT = 'Сообщение агенту.';
+let sttProcess = null;
+async function sttState() {
+  try { const r = await fetch(`http://127.0.0.1:${STT_PORT}/health`, { signal: AbortSignal.timeout(800) }); const j = await r.json(); return j.ready ? 'ready' : j.error ? 'error' : 'loading'; } catch { return ''; }
+}
+async function sttEnsure(waitMs = 60000) {
+  let st = await sttState();
+  if (st === 'ready') return true;
+  if (!st && (!sttProcess || sttProcess.exitCode !== null)) {
+    const py = runtimePython('stt');
+    if (!py) return false;
+    sttProcess = spawn(py, [path.join(__dirname, 'stt_server.py'), String(STT_PORT), runtimePath('models', 'whisper')], { env: childEnv(), stdio: 'ignore', windowsHide: true });
+    sttProcess.on('error', () => {});
+  }
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    st = await sttState();
+    if (st === 'ready') return true;
+    if (st === 'error' || (!st && sttProcess && sttProcess.exitCode !== null)) return false;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return false;
+}
+async function transcribeLocal(buf, mime) {
+  if (!(await sttEnsure())) return { ok: false, error: `Локальное распознавание недоступно (нет окружения ${runtimePath('python', 'stt')}; запустите setup\\install-runtime.ps1).` };
+  const r = await fetch(`http://127.0.0.1:${STT_PORT}/transcribe`, { method: 'POST', headers: { 'content-type': mime, 'x-hint': Buffer.from(STT_HINT).toString('hex') }, body: buf, signal: AbortSignal.timeout(60000) });
+  const j = await r.json().catch(() => ({}));
+  return { ok: !!j.ok, text: String(j.text || '').trim(), error: j.error };
+}
+const providerUrl = () => String(sttUrl || process.env.LITELLM_BASE_URL || '').replace(/\/+$/, '');
 async function transcribe(dataB64, type, filename) {
   if (typeof dataB64 !== 'string' || !dataB64) return { ok: false, error: 'Нет аудиоданных.' };
-  const baseUrl = (process.env.LITELLM_BASE_URL || 'https://litellm.sdvor.duckdns.org/v1').replace(/\/+$/, '');
-  const apiKey = process.env.LITELLM_API_KEY || '';
-  const wav = Buffer.from(dataB64, 'base64');
-  if (wav.length < 1000) return { ok: false, error: 'Аудио слишком короткое.' };
-  const mime = typeof type === 'string' && type ? type : 'audio/wav';
+  const buf = Buffer.from(dataB64, 'base64');
+  if (buf.length < 1000) return { ok: false, error: 'Аудио слишком короткое.' };
+  const mime = typeof type === 'string' && /^audio\/[\w.+-]+$/.test(type) ? type : 'audio/wav';
+  const baseUrl = providerUrl();
+  if (!baseUrl) return transcribeLocal(buf, mime);
   const fname = typeof filename === 'string' && filename ? filename : (mime.includes('webm') ? 'audio.webm' : 'audio.wav');
   const fd = new FormData();
   fd.append('model', 'groq/whisper-large-v3-turbo');
-  fd.append('file', new Blob([wav], { type: mime }), fname);
+  fd.append('file', new Blob([buf], { type: mime }), fname);
   const headers = {};
-  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const res = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST', headers, body: fd, signal: AbortSignal.timeout(60000),
-  });
-  if (!res.ok) return { ok: false, error: `stt http ${res.status}` };
+  if (process.env.LITELLM_API_KEY) headers.authorization = `Bearer ${process.env.LITELLM_API_KEY}`;
+  const res = await fetch(`${baseUrl}/audio/transcriptions`, { method: 'POST', headers, body: fd, signal: AbortSignal.timeout(60000) });
+  if (!res.ok) return { ok: false, error: `Сервер распознавания ответил ошибкой ${res.status}.` };
   const j = await res.json().catch(() => ({}));
   return { ok: true, text: String(j.text || '').trim() };
 }
@@ -382,7 +507,7 @@ async function modelFileResponse(filePath) {
     else if (data.length >= 8 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) type = 'image/png';
     else if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) type = 'image/jpeg';
     else if (data.length >= 12 && data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) type = 'image/webp';
-    return new Response(new Uint8Array(data), { headers: { 'content-type': type, 'access-control-allow-origin': '*' } });
+    return new Response(new Uint8Array(data), { headers: { 'content-type': type, 'access-control-allow-origin': '*' } });   // our own scheme, only reachable from the companion's windows
   } catch (e) {
     dlog('serve: ERROR ' + path.basename(filePath) + ' ' + (e && e.message));
     return new Response('Not found', { status: 404 });
@@ -462,7 +587,7 @@ function runImport(paths) {
   const job = importing.then(async () => {
     const results = await importer.importPaths(paths, MODELS_DIR);
     const ids = results.flatMap((r) => r.imported.map((m) => m.id));
-    if (ids.length && character && !character.webContents.isDestroyed()) character.webContents.send('link:settings', settings());
+    if (ids.length) toCharacter('link:settings', settings());
     if (ids.length && (await waitReady(20000))) {
       for (const r of results) {
         for (const m of r.imported) {
@@ -543,16 +668,30 @@ function waitReady(timeoutMs = 20000) {
 async function loadModel(id) {
   if (typeof id !== 'string' || !MODEL_ID.test(id)) throw new Error('Некорректный id модели.');
   if (!fs.existsSync(path.join(MODELS_DIR, id, 'character.json'))) throw new Error(`Модель "${id}" не найдена.`);
+  const previous = activeModelId;
   activeModelId = id;
-  persist();
-  character.webContents.send('link:settings', settings());
+  gpuLoading(true);
+  toCharacter('link:settings', settings());
   const deadline = Date.now() + 30000;
-  while (Date.now() < deadline) {
-    const result = await commandResult({ name: 'return_to_idle', args: {} }, 4000);
-    if (result && result.ok) return { ok: true, id };
+  let error = 'Модель не загрузилась за отведённое время.';
+  while (Date.now() < deadline && activeModelId === id) {
+    const result = await commandResult({ name: 'sync_character', args: {} }, 5000);   // answers once the model is loaded, or why it is not
+    if (result && result.ok) { gpuLoading(false, true); persist(); return { ok: true, id }; }
+    if (result && result.failed) { error = result.error || error; break; }
     await new Promise((res) => setTimeout(res, 200));
   }
-  return { ok: false, error: 'Модель не загрузилась за отведённое время.' };
+  if (activeModelId !== id) return { ok: false, error: 'Выбрана другая модель.' };
+  if (!(await rendererAlive())) gpuFailed('the window froze while loading a model');
+  gpuLoading(false);
+  if (previous !== id) { activeModelId = previous; toCharacter('link:settings', settings()); }   // the character that was there comes back
+  return { ok: false, error };
+}
+function rendererAlive(timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), timeoutMs);
+    if (!character || character.isDestroyed()) { clearTimeout(t); resolve(false); return; }
+    character.webContents.executeJavaScript('1').then(() => { clearTimeout(t); resolve(true); }, () => { clearTimeout(t); resolve(false); });
+  });
 }
 
 /** Anchor the speech bubble beside the character's head (tail points at it). */
@@ -608,6 +747,7 @@ function placeMenu() {
   );
 }
 
+let recording = false;                                           // the character window is listening to the microphone
 function showMenu(x, y) {
   if (!menu) return;
   if (character && !character.isDestroyed()) {
@@ -617,7 +757,7 @@ function showMenu(x, y) {
     menuOffset = { dx: cursor.x - w - 12 - bounds.x, dy: cursor.y - Math.round(h / 2) - bounds.y };
   }
   placeMenu();
-  menu.webContents.send('menu:opened', { recording: false });
+  menu.webContents.send('menu:opened', { recording });
   menu.show();
   menu.focus();
 }
@@ -639,9 +779,21 @@ function createCharacterWindow() {
     process.stderr.write(`[live2d:${event.level}] ${event.message}\n`);
     dlog('renderer: [' + event.level + '] ' + event.message);
   });
+  // A crashed window, or one whose WebGL context the driver took away, is loaded again (3 times in
+  // 5 minutes: the GPU is not to be trusted here).
+  character.webContents.on('render-process-gone', (_event, d) => { if (d.reason !== 'clean-exit') reviveCharacter('renderer ' + d.reason); });
   character.webContents.on('did-fail-load', (_event, code, description) => {
     process.stderr.write(`[live2d] load failed ${code}: ${description}\n`);
   });
+}
+
+let revived = [];
+function reviveCharacter(reason) {
+  process.stderr.write(`[live2d] ${reason}: reloading the character window\n`);
+  revived = [...revived.filter((t) => Date.now() - t < 5 * 60 * 1000), Date.now()];
+  if (revived.length >= 3) { gpuFailed(reason); if (revived.length > 5) return; }
+  recording = false;
+  setTimeout(() => { if (character && !character.isDestroyed()) character.webContents.reload(); }, 1000);
 }
 
 function createBubbleWindow() {
@@ -714,38 +866,29 @@ function registerIpc() {
   });
   ipcMain.handle('menu:send', (_e, text) => {
     const t = String(text || '').trim();
-    if (t) pendingChat.push(t);
+    if (t) pushChat(t);
     return { ok: true, sent: Boolean(t) };
   });
   // The bubble is click-through except while hovered, so long answers can be wheel-scrolled.
   ipcMain.on('bubble:interactive', (_e, interactive) => {
     if (bubble && !bubble.isDestroyed()) bubble.setIgnoreMouseEvents(!interactive, { forward: true });
   });
-  ipcMain.on('bubble:speak', (_e, speech) => {
-    if (!bubble || bubble.isDestroyed()) return;
-    if (!speech || !speechBubble.enabled || !character || character.isDestroyed() || !character.isVisible()) {
-      bubble.hide();
-      return;
-    }
-    placeBubble();
-    bubble.webContents.send('bubble:speech', speech);
-    if (!bubble.isVisible()) bubble.showInactive();
+  ipcMain.on('bubble:speak', () => { if (bubble && !bubble.isDestroyed()) bubble.hide(); });   // the bubble's own timer, or no model
+  // The sentence after the one being said; null = nothing to say (a kick follows when there is).
+  ipcMain.handle('voice:next', async (_e, epoch) => {
+    if (epoch !== speech.epoch || !aloud()) return null;
+    const text = speech.next();
+    return text ? await synthesize(text) : null;
   });
-  // voice/audio stubs (no TTS/STT in the companion yet) — return benign results
-  ipcMain.handle('voice:synthesize', async (_e, request) => {
-    const text = typeof request?.text === 'string' ? request.text.trim() : '';
-    if (!text) return { ok: false, error: 'Пустой текст.' };
-    try {
-      if (voiceReplies.engine === 'edge') {
-        try { return { ok: true, audio: await edgeSynthesize(text) }; } catch {}       // offline / Edge down: Kokoro below
-      }
-      const audio = await kokoroSynthesize(text, request?.voice, request?.speed);
-      return { ok: true, audio };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  ipcMain.on('voice:hush', () => speech.hush());
+  ipcMain.on('voice:recording', (_e, on) => {
+    recording = on === true;
+    if (menu && !menu.isDestroyed()) menu.webContents.send('menu:recording', recording);
   });
-  ipcMain.handle('voice:voices', async () => ({ voices: VOICES, default: 'sveta' }));
+  ipcMain.on('voice:level', (_e, level) => {
+    if (menu && !menu.isDestroyed() && menu.isVisible()) menu.webContents.send('menu:level', Number(level) || 0);
+  });
+  ipcMain.on('gpu:lost', () => reviveCharacter('WebGL context lost'));
   ipcMain.handle('voice:turn', async (_e, wav) => {
     const buf = Buffer.isBuffer(wav) ? wav
       : wav instanceof ArrayBuffer ? Buffer.from(wav)
@@ -754,7 +897,7 @@ function registerIpc() {
     if (!buf || buf.length < 1000) return { ok: false, error: 'Пустая запись.' };
     try {
       const r = await transcribe(buf.toString('base64'), 'audio/wav', 'audio.wav');
-      if (r.ok && r.text) pendingChat.push(r.text);
+      if (r.ok && r.text) pushChat(r.text);
       return { ok: r.ok, text: r.text || '', error: r.error };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -763,8 +906,6 @@ function registerIpc() {
   ipcMain.handle('desktop:windows', () => []);
   ipcMain.handle('desktop:windowBounds', () => null);
   ipcMain.handle('desktop:perch', () => ({ ok: false, error: 'Недоступно.' }));
-  ipcMain.handle('menu:upload', () => ({ ok: false, error: 'Недоступно.' }));
-  ipcMain.handle('menu:pick', () => ({ ok: false, error: 'Недоступно.' }));
   // Card previews rendered by the character window (render_preview / ensurePreview).
   ipcMain.handle('preview:exists', (_e, id) => typeof id === 'string' && MODEL_ID.test(id) && hasPreview(id));
   ipcMain.handle('preview:upload', (_e, id, png) => {
@@ -777,16 +918,59 @@ function registerIpc() {
   });
 }
 
+// ---- the agent's answers: bubble and voice ----
+let front = null;                                                // the chat shown in the bubble: { id, done, at }
+function speakMessage(body) {
+  const session = typeof body.session === 'string' ? body.session.slice(0, 200) : '';   // '' = the live2d_speak tool
+  const text = String(body.text || ''), final = body.final !== false;
+  // phase: connecting | thinking | tool | answer | error | idle (drives the orb + dots), end = the turn is over
+  const phase = typeof body.phase === 'string' && body.phase ? body.phase : 'answer';
+  const status = typeof body.status === 'string' ? body.status : '';
+  if (session) {
+    if (body.turn === true) speech.turn(session);
+    if (phase === 'end') speech.end(session);
+    else if (phase === 'answer') speech.feed(session, text, final, !aloud());
+    else speech.step(session);
+  } else if (text && aloud()) speech.line(text);
+  if (!bubble || bubble.isDestroyed()) return;
+  if (session) {                                                 // two agents at once: the bubble stays with the one asked last
+    const now = Date.now();
+    if (body.turn === true || !front || front.done || front.id === session || now - front.at > 60000) front = { id: session, done: phase === 'end', at: now };
+    else return;
+  }
+  if (phase === 'end' || phase === 'idle') {
+    // Turn ended: keep a shown answer (bubble.js hides it on its own timer), clear one stuck in thinking/tool.
+    if (lastBubblePhase !== 'answer' && lastBubblePhase !== 'error') bubble.hide();
+  } else if (speechBubble.enabled && (text || status) && character && character.isVisible()) {
+    lastBubblePhase = phase;
+    placeBubble();
+    bubble.webContents.send('bubble:speech', { text, final, phase, status, style: bubbleStyle() });
+    if (!bubble.isVisible()) bubble.showInactive();
+  } else {
+    bubble.hide();
+  }
+}
+
 // ---- HTTP control server ----
+// Only the plugin that started this process may drive it: it passes a random token in the environment.
+// Web pages cannot send the header (and any request with an Origin is refused).
+const TOKEN = process.env.AMADEUS_TOKEN || randomBytes(24).toString('hex');
+delete process.env.AMADEUS_TOKEN;
+function allowed(req) {
+  const got = Buffer.from(String(req.headers['x-amadeus-token'] || '')), want = Buffer.from(TOKEN);
+  return !req.headers.origin && got.length === want.length && timingSafeEqual(got, want);
+}
 const server = http.createServer((req, res) => {
-  const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const json = (code, obj) => { if (res.headersSent || res.destroyed) return; res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  if (!allowed(req)) { req.resume(); json(403, { ok: false, error: 'forbidden' }); return; }
   const readBody = () => new Promise((resolve) => {
     let raw = '';
-    req.on('data', (c) => { raw += c; if (raw.length > 4 * 1024 * 1024) req.destroy(); });
-    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); } });
+    req.setEncoding('utf8');
+    req.on('data', (c) => { raw += c; if (raw.length > 32 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => { try { const v = raw ? JSON.parse(raw) : {}; resolve(v && typeof v === 'object' ? v : {}); } catch { resolve({}); } });
+    req.on('close', () => resolve({}));
   });
-  const u = new URL(req.url, 'http://127.0.0.1');
-  const route = u.pathname;
+  const route = String(req.url || '/').split('?')[0];
   (async () => {
     const body = await readBody();
     if (req.method === 'POST' && route === '/command') {
@@ -819,60 +1003,17 @@ const server = http.createServer((req, res) => {
         const id = body.id;
         if (typeof id !== 'string' || !MODEL_ID.test(id)) throw new Error('Некорректный id модели.');
         fs.rmSync(path.join(MODELS_DIR, id), { recursive: true, force: true });
-        if (activeModelId === id) { activeModelId = ''; persist(); }
+        if (activeModelId === id) { activeModelId = ''; persist(); quiet(); toCharacter('link:settings', settings()); }   // she leaves the screen too
         json(200, { ok: true });
       } catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
-    } else if (req.method === 'GET' && route.startsWith('/preview/')) {
-      const id = route.slice('/preview/'.length);
-      const file = path.join(MODELS_DIR, id, 'preview.png');
-      if (!MODEL_ID.test(id) || !fs.existsSync(file)) { res.writeHead(404); res.end(); return; }
-      try {
-        const data = fs.readFileSync(file);
-        res.writeHead(200, { 'content-type': 'image/png', 'access-control-allow-origin': '*' });
-        res.end(data);
-      } catch { res.writeHead(404); res.end(); }
     } else if (req.method === 'POST' && route === '/speak') {
-      try {
-        const text = String(body.text || '');
-        const final = body.final !== false;
-        // phase: connecting | thinking | tool | answer | error | idle (drives the orb + dots).
-        const phase = typeof body.phase === 'string' && body.phase ? body.phase : 'answer';
-        const status = typeof body.status === 'string' ? body.status : '';
-        // 1. Bubble (LLM answer): place + show + stream text (gated by the master "показывать ответ" toggle).
-        //    bubble.js render() reads speech.style.*, so it must always be present.
-        if (bubble && !bubble.isDestroyed()) {
-          if (phase === 'idle') {
-            // Turn ended: keep a shown answer (bubble.js hides it on its own timer),
-            // clear a bubble stuck in thinking/tool.
-            if (lastBubblePhase !== 'answer') bubble.hide();
-          } else if (speechBubble.enabled && (text || status) && character && character.isVisible()) {
-            lastBubblePhase = phase;
-            placeBubble();
-            bubble.webContents.send('bubble:speech', { text, final, phase, status, style: bubbleStyle() });
-            if (!bubble.isVisible()) bubble.showInactive();
-          } else {
-            bubble.hide();
-          }
-        }
-        // 2. Character mouth lip sync (show_speech command).
-        if (character && !character.isDestroyed() && phase !== 'idle') {
-          commandResult({ name: 'show_speech', args: { text, final, phase, status } }, 8000).catch(() => {});
-        }
-        // 3. TTS audio via Kokoro-ru (play_speech command drives the renderer's
-        //    voice queue → api.synthesize → voice:synthesize → kokoroSynthesize).
-        //    Gated by voiceReplies.enabled; falls back to Windows SAPI if Kokoro is down.
-        //    Not while hidden: a hidden live2D must not read answers on top of the 3D companion.
-        if (voiceReplies.enabled && !hidden && final && text && character && !character.webContents.isDestroyed()) {
-          sendCommand({ name: 'play_speech', args: { parts: [text], voice: voiceReplies.voice, speed: Number(voiceReplies.speed) || 1, append: false, final: true } });
-        }
-        json(200, { ok: true });
-      }
-      catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
+      speakMessage(body);
+      json(200, { ok: true });
     } else if (req.method === 'POST' && route === '/wait_ready') {
       try { const result = await waitReady(body.timeoutMs || 20000); json(200, { ok: true, result }); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
     } else if (req.method === 'GET' && route === '/settings') {
-      json(200, { ok: true, behaviors: { ...behaviors }, hidden, voiceReplies: { ...voiceReplies }, voices: VOICES.slice(), modelScale, hotkeys: { ...hotkeys }, voiceDevices: { ...voiceDevices }, speechBubble: { ...speechBubble } });
+      json(200, publicSettings());
     } else if (req.method === 'POST' && route === '/settings') {
       try { json(200, applySettingsPatch(body)); }
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
@@ -881,7 +1022,6 @@ const server = http.createServer((req, res) => {
       catch (e) { json(200, { ok: false, error: String((e && e.message) || e) }); }
     } else if (req.method === 'POST' && route === '/provider') {
       if (typeof body.key === 'string' && body.key) process.env.LITELLM_API_KEY = body.key;
-      if (typeof body.baseUrl === 'string' && /^https?:\/\//.test(body.baseUrl)) process.env.LITELLM_BASE_URL = body.baseUrl;
       json(200, { ok: true });
     } else if (req.method === 'POST' && route === '/transcribe') {
       try { json(200, await transcribe(body.data, body.type, body.filename)); }
@@ -911,14 +1051,14 @@ const server = http.createServer((req, res) => {
     } else if (req.method === 'GET' && route === '/ping') {
       json(200, { ok: true, pong: true });
     } else if (req.method === 'GET' && route === '/chat-message') {
-      json(200, { ok: true, text: pendingChat.shift() || '' });
+      json(200, { ok: true, text: nextChat() });
     } else if (req.method === 'POST' && route === '/shutdown') {
       json(200, { ok: true });
       setTimeout(() => app.quit(), 150);
     } else {
       json(404, { ok: false, error: 'not found: ' + req.method + ' ' + route });
     }
-  })();
+  })().catch((e) => json(200, { ok: false, error: String((e && e.message) || e) }));
 });
 
 app.whenReady().then(() => {

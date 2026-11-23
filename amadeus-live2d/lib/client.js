@@ -370,7 +370,7 @@ function auiNote(note) {
 
 var DEFAULT_SPEECH_BUBBLE = { enabled: true, mode: "bubble", backgroundColor: "#211e2a", opacity: 0.94, fontColor: "#f5f3fa", fontSize: 14, hideAfter: 10 };
 function settingsFrom(d) {
-  return { hidden: d.hidden, behaviors: d.behaviors || {}, voiceReplies: d.voiceReplies || {}, voices: d.voices || ["sveta", "masha", "dima"], speechBubble: d.speechBubble || DEFAULT_SPEECH_BUBBLE };
+  return { hidden: d.hidden, behaviors: d.behaviors || {}, voiceReplies: d.voiceReplies || {}, voices: d.voices || ["sveta", "masha", "dima"], speechBubble: d.speechBubble || DEFAULT_SPEECH_BUBBLE, voiceError: d.voiceError || null };
 }
 
 // Settings writes: the UI updates at once, requests go one at a time and any
@@ -495,12 +495,12 @@ function CharacterSettingsBar(props) {
   }
 
   if (part === "voice") {
-    return auiCard("voice-replies", "Озвучка ответов", "Персонаж читает готовый ответ агента вслух.", [
+    return auiCard("voice-replies", "Озвучка ответов", "Персонаж читает ответ агента вслух, пока тот пишется. Звучит только выбранный движок.", [
       auiRow("enabled", "Озвучивать ответы", null, auiSwitch(!!vr.enabled, busy, function () { applyPatch({ voiceReplies: { enabled: !vr.enabled } }); })),
       auiRow("engine", "Движок", null, jsx("div", { className: "aui-seg", children: [["edge", "Edge (онлайн)"], ["kokoro", "Kokoro (локально)"]].map(function (m) {
         return jsx("button", { key: m[0], type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + ((vr.engine || "edge") === m[0] ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { engine: m[0] } }); }, children: m[1] });
       }) }), !vr.enabled),
-      (vr.engine || "edge") === "edge" ? auiRow("evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft. Без интернета — Kokoro.", jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.edgeVoice || "ru-RU-SvetlanaNeural", onChange: function (e) { applyPatch({ voiceReplies: { edgeVoice: e.target.value } }); }, children: [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]].map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !vr.enabled) : null,
+      (vr.engine || "edge") === "edge" ? auiRow("evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft.", jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.edgeVoice || "en-US-AvaMultilingualNeural", onChange: function (e) { applyPatch({ voiceReplies: { edgeVoice: e.target.value } }); }, children: [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]].map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !vr.enabled) : null,
       (vr.engine || "edge") === "edge" ? auiRow("erate", "Темп", null, jsx("div", { className: "aui-seg", children: [-10, 0, 10, 20].map(function (x) {
         var cur = vr.edgeRate == null ? 10 : vr.edgeRate;
         return jsx("button", { key: x, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (cur === x ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { edgeRate: x } }); }, children: (x > 0 ? "+" : "") + x + "%" });
@@ -513,7 +513,8 @@ function CharacterSettingsBar(props) {
       (vr.engine || "edge") === "edge" ? null : auiRow("speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (s) {
         var active = String(vr.speed != null ? vr.speed : 1) === s;
         return jsx("button", { key: s, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (active ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { speed: Number(s) } }); }, children: s + "×" });
-      }) }), !vr.enabled)
+      }) }), !vr.enabled),
+      vr.enabled && cfg.voiceError ? jsx("div", { key: "verr", className: "aui-row-hint", children: "Последняя фраза не прозвучала (" + (cfg.voiceError.engine === "edge" ? "Edge" : "Kokoro") + "): " + cfg.voiceError.error }) : null
     ], auiNote(note));
   }
 
@@ -625,7 +626,7 @@ function AudioControlsSection(props) {
 
   var loadCfg = function () {
     fetch("/amadeus-live2d/settings").then(function (r) { return r.json(); }).then(function (d) {
-      if (d && d.ok) setCfg({ modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || ["sveta", "masha", "dima"] });
+      if (d && d.ok) setCfg({ modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || ["sveta", "masha", "dima"], sttUrl: d.sttUrl || "" });
     }).catch(function () {});
   };
   var loadDevices = function () {
@@ -649,7 +650,7 @@ function AudioControlsSection(props) {
   }, []);
 
   var push = usePatchQueue(function (d) {
-    setCfg(function (prev) { return { modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || prev.voices }; });
+    setCfg(function (prev) { return { modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || prev.voices, sttUrl: d.sttUrl || "" }; });
   }, function (text) { setNote({ text: text, error: true }); });
   var applyPatch = function (patch) {
     setNote(null);
@@ -771,6 +772,7 @@ function AudioControlsSection(props) {
         jsx("div", { className: "aui-level", children: jsx("i", { style: { width: Math.round(level * 100) + "%" } }) }),
         jsx("button", { className: "aui-btn" + (refs.current.micOn ? " aui-btn-danger" : ""), type: "button", onClick: toggleMicTest, children: refs.current.micOn ? "Стоп" : "Проверить" })
       ] })),
+      auiRow("stt", "Свой сервер распознавания", "Адрес OpenAI-совместимого API (например LiteLLM: https://…/v1) — туда уходят запись голоса и ключ LITELLM_API_KEY из DSH. Пусто — речь распознаётся на этом компьютере (Whisper).", jsx("input", { className: "aui-select", type: "text", placeholder: "локально", defaultValue: cfg.sttUrl || "", key: "u" + (cfg.sttUrl || ""), style: { width: 240 }, onBlur: function (e) { var v = e.target.value.trim(); if (v !== (cfg.sttUrl || "") && (!v || /^https?:\/\//.test(v))) applyPatch({ sttUrl: v }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } })),
       auiRow("radio", "Режим рации", "Удерживайте кнопку, пока говорите.", auiSwitch(!!cfg.radioEnabled, busy, function () { applyPatch({ radioEnabled: !cfg.radioEnabled }); })),
       cfg.radioEnabled ? jsx("div", { key: "ptt", className: "aui-ptt-wrap", children: jsx("button", { className: "aui-ptt" + (recording ? " aui-ptt-on" : ""), type: "button",
         onPointerDown: function (e) { e.preventDefault(); startRecording(); },
@@ -848,115 +850,6 @@ function pollChatMessage() {
     }).catch(function () {});
   }, 1500);
 }
-function wireSpeech(ctx) {
-  var uiSession = ctx && ctx.uiSession;
-  var uiConversation = ctx && ctx.uiConversation;
-  if (!uiSession || !uiSession.sessionStatus) return;
-  var status = uiSession.sessionStatus;
-  var lastPartial = '';
-  var lastSentFinal = '';
-  var wasRunning = false;
-  var subscribed = {};
-  var trajectorySnapshot = function () {
-    try {
-      if (!uiConversation || typeof uiConversation.binding !== "function") return null;
-      var binding = uiSession.current && uiSession.current.value;
-      var sessionId = (binding && binding.props && binding.props.sessionId) || (binding && binding.key);
-      if (!sessionId) return null;
-      var target = uiConversation.binding(sessionId).target("trajectory");
-      if (!target || typeof target.getSnapshot !== "function") return null;
-      // The trajectory source is lazy: it stays empty until someone subscribes.
-      if (!subscribed[sessionId] && typeof target.subscribe === "function") {
-        subscribed[sessionId] = true;
-        try { target.subscribe(function () { tick(); }); } catch (e) {}
-      }
-      return target.getSnapshot() || null;
-    } catch (e) { return null; }
-  };
-  // What the client could see when a turn ended without text (shows up in /amadeus-live2d/speak-log).
-  var diagnose = function () {
-    var d = {};
-    try {
-      var binding = uiSession.current && uiSession.current.value;
-      d.binding = binding ? Object.keys(binding).slice(0, 12) : null;
-      d.props = binding && binding.props ? Object.keys(binding.props).slice(0, 12) : null;
-      d.sessionId = (binding && binding.props && binding.props.sessionId) || (binding && binding.key) || null;
-      var snap = trajectorySnapshot();
-      d.snap = snap ? Object.keys(snap).slice(0, 12) : null;
-      var nodes = snap && snap.eventNodes;
-      d.nodes = nodes && typeof nodes.length === "number" ? nodes.length : null;
-      if (d.nodes) d.tail = Array.prototype.slice.call(nodes, -4).map(function (n) {
-        return n ? n.kind + ":" + (Array.isArray(n.blocks) ? n.blocks.map(function (b) { return b && b.kind; }).join("|") : Object.keys(n).slice(0, 8).join(",")) : "null";
-      });
-    } catch (e) { d.error = String(e && e.message || e); }
-    return d;
-  };
-  var textBlocks = function (blocks) {
-    if (!Array.isArray(blocks)) return "";
-    var parts = [];
-    blocks.forEach(function (b) { if (b && b.kind === "text" && typeof b.text === "string" && b.text !== "") parts.push(b.text); });
-    return parts.length ? parts.join("\n\n") : "";
-  };
-  var readFinal = function () {
-    var snap = trajectorySnapshot();
-    if (!snap || !Array.isArray(snap.eventNodes)) return "";
-    for (var i = snap.eventNodes.length - 1; i >= 0; i--) {
-      var node = snap.eventNodes[i];
-      if (!node || node.kind !== "assistant") continue;
-      var t = textBlocks(node.blocks);
-      if (t) return t;
-    }
-    return "";
-  };
-  var post = function (body) {
-    fetch("/amadeus-live2d/speak", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).catch(function () {});
-  };
-  var toolName = function (calls) {
-    var c = calls && calls[calls.length - 1];
-    var n = c && (c.name || c.toolName || (c.call && c.call.name) || (c.tool && c.tool.name));
-    return typeof n === "string" && n ? n : "Инструмент";
-  };
-  // Phase for the bubble's orb + dots (same mapping as amadeus-orb's driveFromSession):
-  // runningCalls -> tool, partial text -> answer, otherwise thinking.
-  var lastKey = "";
-  var tick = function () {
-    var running = false;
-    try {
-      var snap = status.getSnapshot();
-      if (snap && typeof snap.forEach === "function") {
-        snap.forEach(function (row) { if (row && row.running === true) running = true; });
-      }
-    } catch (e) {}
-    if (running) {
-      var traj = trajectorySnapshot();
-      var calls = traj && traj.runningCalls;
-      var streaming = traj && traj.partial ? textBlocks(traj.partial.blocks) : "";
-      var body;
-      if (calls && calls.length > 0) body = { text: "", final: false, phase: "tool", status: toolName(calls) };
-      else if (streaming) body = { text: streaming, final: false, phase: "answer", status: "" };
-      else body = { text: "", final: false, phase: "thinking", status: "Думаю…" };
-      if (streaming) lastPartial = streaming;
-      var key = body.phase + "\u0000" + body.status + "\u0000" + body.text;
-      if (key !== lastKey) { lastKey = key; post(body); }
-    } else if (wasRunning) {
-      var done = lastPartial || readFinal();
-      if (done && done !== lastSentFinal) {
-        lastSentFinal = done;
-        post({ text: done, final: true, phase: "answer", status: "" });
-      } else {
-        // stopped without an answer — clear a bubble stuck in thinking/tool
-        post({ text: "", final: true, phase: "idle", status: "" });
-        if (!done) post({ text: "", final: true, phase: "idle", status: "", diag: diagnose() });
-      }
-      lastPartial = "";
-      lastKey = "";
-    }
-    wasRunning = running;
-  };
-  try { if (typeof status.subscribe === "function") status.subscribe(tick); } catch (e) {}
-  tick();
-  setInterval(tick, 250);
-}
 function makeApi(base) {
   function req(p, opts) {
     return fetch(base + p, opts).then(function (r) {
@@ -976,10 +869,10 @@ function makeApi(base) {
   };
 }
 
-    var inject = ["slots", "uiSession", "uiConversation"];
+    var inject = ["slots"];
     function apply(ctx) {
       window.amadeusCharacters = makeApi("/amadeus-live2d");
-      var __speechRun = function () { pollChatMessage(); wireSpeech(ctx); };
+      var __speechRun = pollChatMessage;
       if (typeof document !== "undefined" && document.readyState === "loading") { document.addEventListener("DOMContentLoaded", __speechRun); } else { __speechRun(); }
       if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=\"amadeus-live2d\"]") === null) {
         var tag = document.createElement("style");
