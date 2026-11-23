@@ -1,4 +1,4 @@
-"""Microsoft Edge neural voices for the 3D companion (edge-tts, online).
+"""Microsoft Edge neural voices for the companions (edge-tts, online).
 
     python tts_edge_server.py <port>
 
@@ -19,31 +19,52 @@ VOICES = {'ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNe
           'fr-FR-VivienneMultilingualNeural', 'pt-BR-ThalitaMultilingualNeural'}
 
 
-async def synth_once(text, voice, rate, pitch):
+# Seconds: until the first sound / between two pieces of sound / one whole text / all the tries that
+# brought no sound. The service is often slower than real time, so a text that is being delivered is
+# never cut off just for being long; only silence counts as a failure.
+FIRST_S, GAP_S, TOTAL_S, NO_AUDIO_S = 10, 8, 90, 25
+
+
+class Cut(Exception):
+    """The sound stopped in the middle: a retry would cost as much again, so report it."""
+
+
+async def synth_once(text, voice, rate, pitch, first_s=FIRST_S, end=None):
     out = bytearray()
-    com = edge_tts.Communicate(text, voice, rate=f'{rate:+d}%', pitch=f'{pitch:+d}Hz')
-    async for chunk in com.stream():
-        if chunk['type'] == 'audio':
-            out += chunk['data']
-    return bytes(out)
-
-
-ATTEMPT_S, TOTAL_S = 6, 10                                           # one try / all tries, seconds
+    end = time.monotonic() + TOTAL_S if end is None else end
+    wait_until = min(end, time.monotonic() + first_s)
+    stream = edge_tts.Communicate(text, voice, rate=f'{rate:+d}%', pitch=f'{pitch:+d}Hz').stream()
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(stream.__anext__(), max(0.05, wait_until - time.monotonic()))
+            except StopAsyncIteration:
+                return bytes(out)
+            if chunk['type'] == 'audio' and chunk['data']:
+                out += chunk['data']
+                wait_until = min(end, time.monotonic() + GAP_S)
+    except Exception as e:  # noqa: BLE001
+        if out:
+            raise Cut('Edge прервал звук на середине.') from e
+        raise
+    finally:
+        await stream.aclose()
 
 
 async def synth(text, voice, rate, pitch):
-    """The service now and then answers without audio: try again, then without the pitch shift. All
-    within TOTAL_S, so that one failing sentence never holds the answer up for long."""
+    """The service now and then answers without audio: try again, then without the pitch shift."""
     last = None
-    end = time.monotonic() + TOTAL_S
+    start = time.monotonic()
     for r, p in ((rate, pitch), (rate, pitch), (rate, 0)):
-        left = end - time.monotonic()
+        left = NO_AUDIO_S - (time.monotonic() - start)
         if left < 1:
             break
         try:
-            audio = await asyncio.wait_for(synth_once(text, voice, r, p), min(ATTEMPT_S, left))
+            audio = await synth_once(text, voice, r, p, min(FIRST_S, left), start + TOTAL_S)
             if audio:
                 return audio
+        except Cut:
+            raise
         except Exception as e:  # noqa: BLE001
             last = e
     if last:
@@ -102,5 +123,9 @@ class H(BaseHTTPRequestHandler):
             self.err(502, str(e))
 
 
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = False                                      # Windows would let two servers share the port
+
+
 if __name__ == '__main__':
-    ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
+    Server(('127.0.0.1', PORT), H).serve_forever()

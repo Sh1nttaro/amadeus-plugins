@@ -199,8 +199,7 @@
         }
 
         mic.addEventListener("click", () => {
-          api.menuAction("microphone");
-          setRecording(!recording);
+          api.menuAction("microphone");               // the answer is onMenuRecording: the microphone may refuse
         });
 
         send.addEventListener("click", () => {

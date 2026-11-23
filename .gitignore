@@ -5,6 +5,9 @@ amadeus-live3d/companion/models/
 # Per-user companion settings
 **/companion/settings.json
 
+# Whether the GPU can draw the Live2D model on this computer
+**/companion/gpu.json
+
 # Local backups and debug artifacts
 **/_backup/
 *.orig-bak
@@ -25,3 +28,6 @@ amadeus-providers/data.json
 
 # Per-user harness settings and sessions
 amadeus-harness/data/
+
+# Accessories and gestures the user imported into live2D
+**/companion/props/

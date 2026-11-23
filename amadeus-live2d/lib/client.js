@@ -370,7 +370,7 @@ function auiNote(note) {
 
 var DEFAULT_SPEECH_BUBBLE = { enabled: true, mode: "bubble", backgroundColor: "#211e2a", opacity: 0.94, fontColor: "#f5f3fa", fontSize: 14, hideAfter: 10 };
 function settingsFrom(d) {
-  return { hidden: d.hidden, behaviors: d.behaviors || {}, voiceReplies: d.voiceReplies || {}, voices: d.voices || ["sveta", "masha", "dima"], speechBubble: d.speechBubble || DEFAULT_SPEECH_BUBBLE };
+  return { hidden: d.hidden, behaviors: d.behaviors || {}, voiceReplies: d.voiceReplies || {}, voices: d.voices || ["sveta", "masha", "dima"], speechBubble: d.speechBubble || DEFAULT_SPEECH_BUBBLE, voiceError: d.voiceError || null };
 }
 
 // Settings writes: the UI updates at once, requests go one at a time and any
@@ -487,7 +487,7 @@ function CharacterSettingsBar(props) {
 
   if (part === "screen") {
     return auiCard("behavior", "Поведение", "Как персонаж ведёт себя на рабочем столе.", [
-      auiRow("shown", "Показывать персонажа", "Окно с моделью поверх всех окон.", auiSwitch(!cfg.hidden, busy, function () { applyPatch({ hidden: !cfg.hidden }); })),
+      auiRow("shown", "Показывать персонажа", "Окно с моделью поверх всех окон. Выключите — модель и голос полностью выгрузятся из памяти.", auiSwitch(!cfg.hidden, busy, function () { applyPatch({ hidden: !cfg.hidden }); })),
       auiRow("wander", "Гулять по экрану", "Сам перемещается по рабочему столу.", auiSwitch(b.wander !== false, busy, function () { applyPatch({ behaviors: { wander: b.wander === false } }); }), cfg.hidden),
       auiRow("perch", "Садиться на окна", "Может устроиться на верхнем краю окна.", auiSwitch(b.perch !== false, busy, function () { applyPatch({ behaviors: { perch: b.perch === false } }); }), cfg.hidden),
       auiRow("cursor", "Следить за курсором", "Поворачивает голову и взгляд за мышью.", auiSwitch(b.cursor !== false, busy, function () { applyPatch({ behaviors: { cursor: b.cursor === false } }); }), cfg.hidden)
@@ -495,12 +495,12 @@ function CharacterSettingsBar(props) {
   }
 
   if (part === "voice") {
-    return auiCard("voice-replies", "Озвучка ответов", "Персонаж читает готовый ответ агента вслух.", [
+    return auiCard("voice-replies", "Озвучка ответов", "Персонаж читает ответ агента вслух, пока тот пишется. Звучит только выбранный движок.", [
       auiRow("enabled", "Озвучивать ответы", null, auiSwitch(!!vr.enabled, busy, function () { applyPatch({ voiceReplies: { enabled: !vr.enabled } }); })),
       auiRow("engine", "Движок", null, jsx("div", { className: "aui-seg", children: [["edge", "Edge (онлайн)"], ["kokoro", "Kokoro (локально)"]].map(function (m) {
         return jsx("button", { key: m[0], type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + ((vr.engine || "edge") === m[0] ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { engine: m[0] } }); }, children: m[1] });
       }) }), !vr.enabled),
-      (vr.engine || "edge") === "edge" ? auiRow("evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft. Без интернета — Kokoro.", jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.edgeVoice || "ru-RU-SvetlanaNeural", onChange: function (e) { applyPatch({ voiceReplies: { edgeVoice: e.target.value } }); }, children: [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]].map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !vr.enabled) : null,
+      (vr.engine || "edge") === "edge" ? auiRow("evoice", "Голос", "Нейроголоса Microsoft: живая интонация. Нужен интернет, текст ответа уходит в Microsoft.", jsx("select", { className: "aui-select", disabled: busy || !vr.enabled, value: vr.edgeVoice || "en-US-AvaMultilingualNeural", onChange: function (e) { applyPatch({ voiceReplies: { edgeVoice: e.target.value } }); }, children: [["ru-RU-SvetlanaNeural", "Светлана (русский)"], ["en-US-AvaMultilingualNeural", "Ava (многоязычный)"], ["en-US-EmmaMultilingualNeural", "Emma (многоязычный)"], ["ru-RU-DmitryNeural", "Дмитрий (русский, мужской)"]].map(function (x) { return jsx("option", { key: x[0], value: x[0], children: x[1] }); }) }), !vr.enabled) : null,
       (vr.engine || "edge") === "edge" ? auiRow("erate", "Темп", null, jsx("div", { className: "aui-seg", children: [-10, 0, 10, 20].map(function (x) {
         var cur = vr.edgeRate == null ? 10 : vr.edgeRate;
         return jsx("button", { key: x, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (cur === x ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { edgeRate: x } }); }, children: (x > 0 ? "+" : "") + x + "%" });
@@ -513,7 +513,8 @@ function CharacterSettingsBar(props) {
       (vr.engine || "edge") === "edge" ? null : auiRow("speed", "Скорость речи", null, jsx("div", { className: "aui-seg", children: ["0.75", "1", "1.25", "1.5"].map(function (s) {
         var active = String(vr.speed != null ? vr.speed : 1) === s;
         return jsx("button", { key: s, type: "button", disabled: busy || !vr.enabled, className: "aui-seg-btn" + (active ? " aui-seg-btn-active" : ""), onClick: function () { applyPatch({ voiceReplies: { speed: Number(s) } }); }, children: s + "×" });
-      }) }), !vr.enabled)
+      }) }), !vr.enabled),
+      vr.enabled && cfg.voiceError ? jsx("div", { key: "verr", className: "aui-row-hint", children: "Последняя фраза не прозвучала (" + (cfg.voiceError.engine === "edge" ? "Edge" : "Kokoro") + "): " + cfg.voiceError.error }) : null
     ], auiNote(note));
   }
 
@@ -564,7 +565,147 @@ function CharacterSettingsBar(props) {
   ] });
 }
 
-var LIVE2D_TABS = [["characters", "Персонажи"], ["screen", "На экране"], ["answers", "Ответы агента"], ["voice", "Голос и звук"]];
+// ---- accessories and gestures
+var PROP_ANCHORS = [["head", "Голова"], ["mouth", "Рот"], ["body", "Тело"], ["figure", "Рядом (не двигается)"]];
+var PROP_ANIMS = [["pop", "Появиться"], ["slide", "Выехать снизу"], ["swing", "Покачаться"], ["flick", "Щелчок"], ["fade", "Плавно"]];
+var PROP_EVENTS = [["start", "Принял задачу"], ["thinking", "Думает"], ["tool", "Вызвал инструмент"], ["done", "Закончил ответ"], ["error", "Ошибка"], ["click", "Клик по персонажу"]];
+var PROP_FILES = /\.(png|jpe?g|webp|gif|zip|rar|7z)$/i;
+function AccessoriesSection() {
+  var dataState = react.useState(null);
+  var data = dataState[0], setData = dataState[1];
+  var noteState = react.useState(null);
+  var note = noteState[0], setNote = noteState[1];
+  var openState = react.useState("");
+  var open = openState[0], setOpen = openState[1];
+  var busyState = react.useState("");
+  var busy = busyState[0], setBusy = busyState[1];
+  var dragState = react.useState(false);
+  var drag = dragState[0], setDrag = dragState[1];
+  var fileRef = react.useRef(null);
+  var placeQueue = react.useRef({ timer: 0, id: "", place: null });
+  var adjustRef = react.useRef("");
+  var take = function (d) {
+    if (!d || !d.ok) { setNote({ text: (d && d.error) || "Не удалось выполнить.", error: true }); return null; }
+    adjustRef.current = d.adjusting || "";
+    if (d.items) setData(d);
+    if (d.added) {
+      var text = (d.added.length ? "Добавлено: " + d.added.join(", ") + ". " : "") + (d.problems || []).join(" ");
+      if (text) setNote({ text: text, error: !d.added.length });
+    }
+    return d;
+  };
+  var run = function (op, body, label) {
+    setNote(null);
+    if (label) setBusy(label);
+    return fetch("/amadeus-live2d/props", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(Object.assign({ op: op }, body || {})) })
+      .then(function (r) { return r.json(); }).then(take)
+      .catch(function (e) { setNote({ text: (e && e.message) || "Ошибка.", error: true }); })
+      .finally(function () { if (label) setBusy(""); });
+  };
+  react.useEffect(function () {
+    run("list");
+    return function () {                                        // leaving the tab: nothing stays in the moving mode
+      if (adjustRef.current) fetch("/amadeus-live2d/props", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "adjust", on: false }) }).catch(function () {});
+    };
+  }, []);
+  var adjusting = (data && data.adjusting) || "";
+  react.useEffect(function () {                                 // moved with the mouse: show the numbers that result
+    if (!adjusting) return undefined;
+    var t = setInterval(function () { fetch("/amadeus-live2d/props", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "list" }) }).then(function (r) { return r.json(); }).then(function (d) { if (d && d.ok) { adjustRef.current = d.adjusting || ""; setData(d); } }).catch(function () {}); }, 1500);
+    return function () { clearInterval(t); };
+  }, [adjusting]);
+  // Sliders: the picture moves at once on screen, the writes go at most 12 times a second.
+  var setPlace = function (p, patch) {
+    setData(function (prev) { return Object.assign({}, prev, { items: prev.items.map(function (x) { return x.id === p.id ? Object.assign({}, x, { place: Object.assign({}, x.place, patch) }) : x; }) }); });
+    var q = placeQueue.current;
+    if (q.id !== p.id && q.place) { run("place", { id: q.id, place: q.place }); q.place = null; }
+    q.id = p.id; q.place = Object.assign({}, q.place, patch);
+    if (q.timer) return;
+    q.timer = setTimeout(function () { var place = q.place; q.timer = 0; q.place = null; if (place) run("place", { id: q.id, place: place }); }, 80);
+  };
+  var upload = function (files) {
+    files = files.filter(function (f) { return PROP_FILES.test(f.name); });
+    if (!files.length) { setNote({ text: "Перетащите картинку (PNG, WebP, GIF, JPEG) или архив .zip, .rar, .7z.", error: true }); return; }
+    setNote(null); setBusy("Добавляю…");
+    var batch = String(Date.now()) + Math.random().toString(16).slice(2);
+    var next = function (i) {
+      fetch("/amadeus-live2d/props-upload?name=" + encodeURIComponent(files[i].name) + "&batch=" + batch + "&last=" + (i === files.length - 1 ? 1 : 0), { method: "POST", body: files[i] })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (!d || !d.ok) { setBusy(""); setNote({ text: files[i].name + ": " + ((d && d.error) || "ошибка"), error: true }); return; }
+          if (i < files.length - 1) next(i + 1); else { setBusy(""); take(d); }
+        })
+        .catch(function (e) { setBusy(""); setNote({ text: files[i].name + ": " + ((e && e.message) || "ошибка"), error: true }); });
+    };
+    next(0);
+  };
+  var items = (data && data.items) || [], model = data && data.model;
+  var select = function (value, options, onChange, disabled) { return jsx("select", { className: "aui-select", value: value, disabled: disabled, onChange: function (e) { onChange(e.target.value); }, children: options.map(function (o) { return jsx("option", { key: o[0], value: o[0], children: o[1] }); }) }); };
+  var button = function (key, text, onClick, cls, disabled) { return jsx("button", { key: key, type: "button", className: "aui-btn" + (cls ? " " + cls : ""), disabled: disabled, onClick: onClick, children: text }); };
+  var editor = function (p) {
+    var place = p.place, face = place.anchor === "head" || place.anchor === "mouth", span = face ? 5 : 1;
+    var off = !model;
+    return jsx("div", { key: "ed", className: "aui-card-body", children: [
+      auiRow("kind", "Что это", null, jsx("div", { className: "aui-seg", children: [["accessory", "Аксессуар"], ["gesture", "Жест"]].map(function (k) { return jsx("button", { key: k[0], type: "button", className: "aui-seg-btn" + (p.kind === k[0] ? " aui-seg-btn-active" : ""), onClick: function () { run("update", { id: p.id, kind: k[0] }); }, children: k[1] }); }) })),
+      auiRow("name", "Название", null, jsx("input", { key: p.name, className: "aui-select", type: "text", defaultValue: p.name, style: { width: 200 }, onBlur: function (e) { var v = e.target.value.trim(); if (v && v !== p.name) run("update", { id: p.id, name: v }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } })),
+      p.kind === "gesture" ? auiRow("anim", "Движение", null, select(p.anim || "pop", PROP_ANIMS, function (v) { run("update", { id: p.id, anim: v }); })) : null,
+      (p.expressions || []).length ? auiRow("expr", "Выражение", "Состояние Live2D-предмета.", select(p.expression || "", [["", "обычное"]].concat(p.expressions.map(function (x) { return [x, x]; })), function (v) { run("update", { id: p.id, expression: v }); })) : null,
+      p.images.length > 1 && p.images[0].role === "frame" ? auiRow("order", "Порядок кадров", "Номера через пробел, последний кадр держится дольше. Всего кадров: " + p.images.length + ".", jsx("input", { key: "o" + (p.order || []).join(), className: "aui-select", type: "text", style: { width: 140 }, defaultValue: (p.order && p.order.length ? p.order : p.images.map(function (x, i) { return i; })).map(function (i) { return i + 1; }).join(" "), onBlur: function (e) { run("update", { id: p.id, order: e.target.value.split(/[^0-9]+/).filter(Boolean).map(function (n) { return Number(n) - 1; }) }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } })) : null,
+      auiRow("anchor", "Держится за", "Голова и рот двигаются вместе с поворотом персонажа.", select(place.anchor, PROP_ANCHORS, function (v) { run("place", { id: p.id, place: { anchor: v } }); }, off)),
+      auiRow("layer", "Слой", null, select(place.layer, [["front", "Перед персонажем"], ["back", "Позади персонажа"]], function (v) { run("place", { id: p.id, place: { layer: v } }); }, off)),
+      auiRow("mouse", "Поправить мышкой", adjusting === p.id ? "Тащите предмет на экране. Колесо — размер, Shift + колесо — поворот." : "Предмет можно будет двигать прямо на персонаже.", button("a", adjusting === p.id ? "Готово" : "Двигать", function () { run("adjust", { id: p.id, on: adjusting !== p.id }); }, adjusting === p.id ? "aui-btn-primary" : "", off)),
+      auiRow("size", "Размер", null, auiRange(Math.round(place.size * 100), face ? 20 : 4, face ? 800 : 200, face ? 5 : 1, "%", off, function (v) { setPlace(p, { size: v / 100 }); })),
+      auiRow("x", "Влево / вправо", null, auiRange(Math.round(place.x * 100), -100 * span, 100 * span, face ? 5 : 1, "", off, function (v) { setPlace(p, { x: v / 100 }); })),
+      auiRow("y", "Вниз / вверх", null, auiRange(Math.round(place.y * 100), -100 * span, 100 * span, face ? 5 : 1, "", off, function (v) { setPlace(p, { y: v / 100 }); })),
+      auiRow("rot", "Поворот", null, auiRange(Math.round(place.rot || 0), -180, 180, 1, "°", off, function (v) { setPlace(p, { rot: v }); })),
+      auiRow("flip", "Отразить", null, auiSwitch(!!place.flip, off, function () { run("place", { id: p.id, place: { flip: !place.flip } }); })),
+      auiRow("more", "Настройка этой модели", "У каждой модели своё положение предмета.", jsx("div", { className: "aui-inline", children: [
+        button("s", "Взять для всех моделей", function () { run("share", { id: p.id }); }, "", off),
+        button("r", "Сбросить", function () { run("reset", { id: p.id }); }, "", off),
+        button("d", "Удалить", function () { if (window.confirm("Удалить «" + p.name + "»?")) { setOpen(""); run("remove", { id: p.id }); } }, "aui-btn-danger")
+      ] }))
+    ].filter(Boolean) });
+  };
+  var row = function (p) {
+    var first = p.images[0];
+    return jsx("div", { key: p.id, children: [
+      jsx("div", { key: "r", className: "aui-row", children: [
+        jsx("div", { key: "t", className: "aui-row-text", style: { display: "flex", flexDirection: "row", alignItems: "center", gap: 10 }, children: [
+          jsx("img", { key: "i", src: first ? "/amadeus-live2d/prop-image/" + p.id + "/" + first.file : "", alt: "", style: { width: 44, height: 44, objectFit: "contain", flex: "0 0 auto" } }),
+          jsx("span", { key: "n", className: "aui-row-label", children: p.name + (p.model ? " · Live2D" : p.images.length > 1 ? (p.images[0].role === "frame" ? " · кадров: " : " · слоёв: ") + p.images.length : "") })
+        ] }),
+        jsx("div", { key: "c", className: "aui-inline", children: [
+          p.kind === "gesture" ? button("show", "Показать", function () { run("show", { id: p.id }); }, "", !model) : auiSwitch(!!p.on, !model, function () { run("wear", { id: p.id, on: !p.on }); }),
+          button("edit", open === p.id ? "Свернуть" : "Настроить", function () { setOpen(open === p.id ? "" : p.id); })
+        ] })
+      ] }),
+      open === p.id ? editor(p) : null
+    ] });
+  };
+  var wearables = items.filter(function (p) { return p.kind === "accessory"; }), gestures = items.filter(function (p) { return p.kind === "gesture"; });
+  var events = (data && data.events) || {};
+  return jsx("div", { className: "aui-stack", children: [
+    auiCard("add", "Добавить", "Картинки PNG, WebP, GIF, JPEG или архив с ними (например, с BOOTH). Файлы остаются на этом компьютере. Live2D-предметы (.moc3) тоже подходят, исходники (.cmo3, .psd) — нет. Парные файлы (front + back) бросайте вместе.", [
+      jsx("div", { key: "drop", className: "aui-drop" + (drag ? " aui-drop-over" : "") + (busy ? " aui-drop-busy" : ""),
+        onDragOver: function (e) { e.preventDefault(); setDrag(true); }, onDragLeave: function () { setDrag(false); },
+        onDrop: function (e) { e.preventDefault(); setDrag(false); upload(Array.prototype.slice.call((e.dataTransfer && e.dataTransfer.files) || [])); },
+        children: [
+          jsx("div", { key: "t", className: "aui-drop-title", children: busy || "Перетащите файлы сюда" }),
+          jsx("div", { key: "b", className: "aui-inline", children: [button("f", "Выбрать файлы…", function () { if (fileRef.current) fileRef.current.click(); }, "aui-btn-primary", !!busy)] }),
+          jsx("input", { key: "i", className: "aui-hidden", type: "file", multiple: true, accept: ".png,.webp,.gif,.jpg,.jpeg,.zip,.rar,.7z", ref: fileRef, onChange: function (e) { var f = Array.prototype.slice.call(e.target.files || []); e.target.value = ""; if (f.length) upload(f); } })
+        ] })
+    ], auiNote(note)),
+    data && !model ? auiNote({ text: "Сначала выберите персонажа во вкладке «Персонажи»." }) : null,
+    auiCard("wear", "Аксессуары", "Надеты на текущего персонажа. Предмет встаёт примерно на место, дальше один раз поправьте его для этой модели.", wearables.length ? wearables.map(row) : [jsx("div", { key: "e", className: "aui-empty aui-empty-tight", children: "Пока пусто." })]),
+    auiCard("gest", "Жесты", "Появляются на несколько секунд. Агент тоже может показать жест сам.", gestures.length ? gestures.map(row).concat([
+      auiRow("sec", "Показывать", null, auiRange((data && data.seconds) || 3, 1, 10, 0.5, " с", false, function (v) { setData(Object.assign({}, data, { seconds: v })); run("seconds", { seconds: v }); }))
+    ]).concat(PROP_EVENTS.map(function (e) {
+      return auiRow("ev-" + e[0], "Событие: " + e[1].toLowerCase(), null, select(events[e[0]] || "", [["", "—"]].concat(gestures.map(function (p) { return [p.id, p.name]; })), function (v) { run("event", { event: e[0], id: v }); }));
+    })) : [jsx("div", { key: "e", className: "aui-empty aui-empty-tight", children: "Пока пусто." })])
+  ] });
+}
+
+var LIVE2D_TABS = [["characters", "Персонажи"], ["props", "Аксессуары"], ["screen", "На экране"], ["answers", "Ответы агента"], ["voice", "Голос и звук"]];
 function Live2DPage() {
   var tabState = react.useState(function () {
     try { var saved = window.localStorage.getItem("amadeus-live2d-tab"); if (saved && LIVE2D_TABS.some(function (t) { return t[0] === saved; })) return saved; } catch (e) {}
@@ -592,6 +733,7 @@ function Live2DPage() {
     : jsx("span", { className: "aui-pill aui-pill-on", children: "На экране" });
   var body;
   if (tab === "characters") body = jsx(CharactersSection, { onSelect: refreshStatus });
+  else if (tab === "props") body = jsx(AccessoriesSection, {});
   else if (tab === "screen") body = jsx("div", { className: "aui-stack", children: [jsx(CharacterSettingsBar, { key: "b", part: "screen", onChange: refreshStatus }), jsx(AudioControlsSection, { key: "s", part: "scale" })] });
   else if (tab === "answers") body = jsx(CharacterSettingsBar, { part: "answers" });
   else body = jsx("div", { className: "aui-stack", children: [jsx(CharacterSettingsBar, { key: "v", part: "voice" }), jsx(AudioControlsSection, { key: "m", part: "voice" })] });
@@ -625,7 +767,7 @@ function AudioControlsSection(props) {
 
   var loadCfg = function () {
     fetch("/amadeus-live2d/settings").then(function (r) { return r.json(); }).then(function (d) {
-      if (d && d.ok) setCfg({ modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || ["sveta", "masha", "dima"] });
+      if (d && d.ok) setCfg({ modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || ["sveta", "masha", "dima"], sttUrl: d.sttUrl || "" });
     }).catch(function () {});
   };
   var loadDevices = function () {
@@ -649,7 +791,7 @@ function AudioControlsSection(props) {
   }, []);
 
   var push = usePatchQueue(function (d) {
-    setCfg(function (prev) { return { modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || prev.voices }; });
+    setCfg(function (prev) { return { modelScale: d.modelScale != null ? d.modelScale : 1, radioEnabled: !!(d.hotkeys && d.hotkeys.radioEnabled), voiceDevices: d.voiceDevices || {}, voices: d.voices || prev.voices, sttUrl: d.sttUrl || "" }; });
   }, function (text) { setNote({ text: text, error: true }); });
   var applyPatch = function (patch) {
     setNote(null);
@@ -771,6 +913,7 @@ function AudioControlsSection(props) {
         jsx("div", { className: "aui-level", children: jsx("i", { style: { width: Math.round(level * 100) + "%" } }) }),
         jsx("button", { className: "aui-btn" + (refs.current.micOn ? " aui-btn-danger" : ""), type: "button", onClick: toggleMicTest, children: refs.current.micOn ? "Стоп" : "Проверить" })
       ] })),
+      auiRow("stt", "Свой сервер распознавания", "Адрес OpenAI-совместимого API (например LiteLLM: https://…/v1) — туда уходят запись голоса и ключ LITELLM_API_KEY из DSH. Пусто — речь распознаётся на этом компьютере (Whisper).", jsx("input", { className: "aui-select", type: "text", placeholder: "локально", defaultValue: cfg.sttUrl || "", key: "u" + (cfg.sttUrl || ""), style: { width: 240 }, onBlur: function (e) { var v = e.target.value.trim(); if (v !== (cfg.sttUrl || "") && (!v || /^https?:\/\//.test(v))) applyPatch({ sttUrl: v }); }, onKeyDown: function (e) { if (e.key === "Enter") e.target.blur(); } })),
       auiRow("radio", "Режим рации", "Удерживайте кнопку, пока говорите.", auiSwitch(!!cfg.radioEnabled, busy, function () { applyPatch({ radioEnabled: !cfg.radioEnabled }); })),
       cfg.radioEnabled ? jsx("div", { key: "ptt", className: "aui-ptt-wrap", children: jsx("button", { className: "aui-ptt" + (recording ? " aui-ptt-on" : ""), type: "button",
         onPointerDown: function (e) { e.preventDefault(); startRecording(); },
@@ -848,115 +991,6 @@ function pollChatMessage() {
     }).catch(function () {});
   }, 1500);
 }
-function wireSpeech(ctx) {
-  var uiSession = ctx && ctx.uiSession;
-  var uiConversation = ctx && ctx.uiConversation;
-  if (!uiSession || !uiSession.sessionStatus) return;
-  var status = uiSession.sessionStatus;
-  var lastPartial = '';
-  var lastSentFinal = '';
-  var wasRunning = false;
-  var subscribed = {};
-  var trajectorySnapshot = function () {
-    try {
-      if (!uiConversation || typeof uiConversation.binding !== "function") return null;
-      var binding = uiSession.current && uiSession.current.value;
-      var sessionId = (binding && binding.props && binding.props.sessionId) || (binding && binding.key);
-      if (!sessionId) return null;
-      var target = uiConversation.binding(sessionId).target("trajectory");
-      if (!target || typeof target.getSnapshot !== "function") return null;
-      // The trajectory source is lazy: it stays empty until someone subscribes.
-      if (!subscribed[sessionId] && typeof target.subscribe === "function") {
-        subscribed[sessionId] = true;
-        try { target.subscribe(function () { tick(); }); } catch (e) {}
-      }
-      return target.getSnapshot() || null;
-    } catch (e) { return null; }
-  };
-  // What the client could see when a turn ended without text (shows up in /amadeus-live2d/speak-log).
-  var diagnose = function () {
-    var d = {};
-    try {
-      var binding = uiSession.current && uiSession.current.value;
-      d.binding = binding ? Object.keys(binding).slice(0, 12) : null;
-      d.props = binding && binding.props ? Object.keys(binding.props).slice(0, 12) : null;
-      d.sessionId = (binding && binding.props && binding.props.sessionId) || (binding && binding.key) || null;
-      var snap = trajectorySnapshot();
-      d.snap = snap ? Object.keys(snap).slice(0, 12) : null;
-      var nodes = snap && snap.eventNodes;
-      d.nodes = nodes && typeof nodes.length === "number" ? nodes.length : null;
-      if (d.nodes) d.tail = Array.prototype.slice.call(nodes, -4).map(function (n) {
-        return n ? n.kind + ":" + (Array.isArray(n.blocks) ? n.blocks.map(function (b) { return b && b.kind; }).join("|") : Object.keys(n).slice(0, 8).join(",")) : "null";
-      });
-    } catch (e) { d.error = String(e && e.message || e); }
-    return d;
-  };
-  var textBlocks = function (blocks) {
-    if (!Array.isArray(blocks)) return "";
-    var parts = [];
-    blocks.forEach(function (b) { if (b && b.kind === "text" && typeof b.text === "string" && b.text !== "") parts.push(b.text); });
-    return parts.length ? parts.join("\n\n") : "";
-  };
-  var readFinal = function () {
-    var snap = trajectorySnapshot();
-    if (!snap || !Array.isArray(snap.eventNodes)) return "";
-    for (var i = snap.eventNodes.length - 1; i >= 0; i--) {
-      var node = snap.eventNodes[i];
-      if (!node || node.kind !== "assistant") continue;
-      var t = textBlocks(node.blocks);
-      if (t) return t;
-    }
-    return "";
-  };
-  var post = function (body) {
-    fetch("/amadeus-live2d/speak", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).catch(function () {});
-  };
-  var toolName = function (calls) {
-    var c = calls && calls[calls.length - 1];
-    var n = c && (c.name || c.toolName || (c.call && c.call.name) || (c.tool && c.tool.name));
-    return typeof n === "string" && n ? n : "Инструмент";
-  };
-  // Phase for the bubble's orb + dots (same mapping as amadeus-orb's driveFromSession):
-  // runningCalls -> tool, partial text -> answer, otherwise thinking.
-  var lastKey = "";
-  var tick = function () {
-    var running = false;
-    try {
-      var snap = status.getSnapshot();
-      if (snap && typeof snap.forEach === "function") {
-        snap.forEach(function (row) { if (row && row.running === true) running = true; });
-      }
-    } catch (e) {}
-    if (running) {
-      var traj = trajectorySnapshot();
-      var calls = traj && traj.runningCalls;
-      var streaming = traj && traj.partial ? textBlocks(traj.partial.blocks) : "";
-      var body;
-      if (calls && calls.length > 0) body = { text: "", final: false, phase: "tool", status: toolName(calls) };
-      else if (streaming) body = { text: streaming, final: false, phase: "answer", status: "" };
-      else body = { text: "", final: false, phase: "thinking", status: "Думаю…" };
-      if (streaming) lastPartial = streaming;
-      var key = body.phase + "\u0000" + body.status + "\u0000" + body.text;
-      if (key !== lastKey) { lastKey = key; post(body); }
-    } else if (wasRunning) {
-      var done = lastPartial || readFinal();
-      if (done && done !== lastSentFinal) {
-        lastSentFinal = done;
-        post({ text: done, final: true, phase: "answer", status: "" });
-      } else {
-        // stopped without an answer — clear a bubble stuck in thinking/tool
-        post({ text: "", final: true, phase: "idle", status: "" });
-        if (!done) post({ text: "", final: true, phase: "idle", status: "", diag: diagnose() });
-      }
-      lastPartial = "";
-      lastKey = "";
-    }
-    wasRunning = running;
-  };
-  try { if (typeof status.subscribe === "function") status.subscribe(tick); } catch (e) {}
-  tick();
-  setInterval(tick, 250);
-}
 function makeApi(base) {
   function req(p, opts) {
     return fetch(base + p, opts).then(function (r) {
@@ -976,10 +1010,10 @@ function makeApi(base) {
   };
 }
 
-    var inject = ["slots", "uiSession", "uiConversation"];
+    var inject = ["slots"];
     function apply(ctx) {
       window.amadeusCharacters = makeApi("/amadeus-live2d");
-      var __speechRun = function () { pollChatMessage(); wireSpeech(ctx); };
+      var __speechRun = pollChatMessage;
       if (typeof document !== "undefined" && document.readyState === "loading") { document.addEventListener("DOMContentLoaded", __speechRun); } else { __speechRun(); }
       if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=\"amadeus-live2d\"]") === null) {
         var tag = document.createElement("style");

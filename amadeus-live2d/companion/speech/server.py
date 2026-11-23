@@ -97,6 +97,7 @@ def main() -> None:
     reason = unavailable()
     if reason:
         print(f"[tts] unavailable: {reason}", flush=True)
+    ThreadingHTTPServer.allow_reuse_address = False              # Windows would let two servers share the port
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 

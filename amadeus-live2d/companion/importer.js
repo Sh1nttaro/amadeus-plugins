@@ -608,4 +608,7 @@ function relabel(dir) {
   return { changed };
 }
 
-module.exports = { importPaths, relabel, translateLabel, ARCHIVE_EXT };
+/** Unpack an archive with the archives inside it. */
+async function extractAll(file, dest) { await extractArchive(file, dest); await expandNested(dest, 0); }
+
+module.exports = { importPaths, relabel, translateLabel, ARCHIVE_EXT, extractAll, walkFiles };
