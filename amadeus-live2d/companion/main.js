@@ -166,7 +166,7 @@ async function kokoroEnsure() {
 }
 // ---- Edge neural voices (online): the same small edge-tts server as live3D (shared port)
 const EDGE_PORT = 58323;
-const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural'];
+const EDGE_VOICES = ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural', 'en-US-AvaMultilingualNeural', 'en-US-EmmaMultilingualNeural', 'fr-FR-VivienneMultilingualNeural', 'pt-BR-ThalitaMultilingualNeural'];
 let edgeProcess = null;
 function edgePython() { return runtimePython('tts'); }
 async function edgeHealthy() {

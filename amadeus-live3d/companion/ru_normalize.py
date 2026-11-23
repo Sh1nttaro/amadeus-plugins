@@ -130,6 +130,14 @@ def _suffixed(m):
     return ordinal_words(int(m.group(1)), _SUFFIX_CASE[m.group(2).lower()])
 
 
+def _integer(m):
+    """A code (leading zeros) or a very long number is read digit by digit."""
+    d = m.group(0)
+    if len(d) > 15 or (len(d) > 1 and d[0] == '0'):
+        return ' '.join(number_words(int(c)) for c in d)
+    return number_words(int(d))
+
+
 def _decimal(m):
     whole, frac = m.group(1), m.group(2)[:3]
     w = int(whole)
@@ -185,7 +193,7 @@ def _latin_word(m):
 _SYMBOLS = [
     (re.compile(r'(\d)\s*%'), r'\1 процентов'), (re.compile(r'%'), ' процентов'),
     (re.compile(r'\b(\d{1,2}):(\d{2})\b'), r'\1 \2'),
-    (re.compile(r'(\d)\s*[–—]\s*(\d)'), r'от \1 до \2'),
+    (re.compile(r'(?<![\d.,–—-])(\d+(?:[.,]\d+)?)\s*[–—]\s*(\d+(?:[.,]\d+)?)(?![\d–—-])'), r'\1-\2'),
     (re.compile(r'№\s*'), 'номер '), (re.compile(r'\s&\s'), ' и '), (re.compile(r'\+'), ' плюс '),
     (re.compile(r'(\d)\s*°C?'), r'\1 градусов'), (re.compile(r'(\d)\s*₽'), r'\1 рублей'),
     (re.compile(r'\$\s*(\d[\d.,]*)'), r'\1 долларов'), (re.compile(r'(\d)\s*\$'), r'\1 долларов'),
@@ -198,13 +206,15 @@ _SYMBOLS = [
 def normalize(text: str) -> str:
     for pattern, repl in _SYMBOLS:
         text = pattern.sub(repl, text)
-    text = re.sub(r'(\d)[  ](?=\d{3}\b)', r'\1', text)        # 1 000 000 -> 1000000
-    text = re.sub(r'\b(\d{1,4})\s*(год|года|году|годом|годах|годов)\b', _year, text, flags=re.I)
+    text = re.sub(r'(?<![\d.,])\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?!\d)', lambda m: re.sub(r'\D', '', m.group(0)), text)   # 1 000 000 -> 1000000
+    text = re.sub(r'(?<![\w.,)])[-−](?=\d)', 'минус ', text)                                     # -5
+    text = re.sub(r'(?<![\d.])\d+(?:\.\d+){2,}(?![\d.]*\d)', lambda m: m.group(0).replace('.', ' точка '), text)   # 5.6.1, 192.168.0.1
+    text = re.sub(r'\b((?:1\d|20|21)\d\d)\s*(год|года|году|годом|годах|годов)\b', _year, text, flags=re.I)   # calendar years only: "3 года" is a count
     text = re.sub(r'(?i)\b(' + _DATE_WORDS + r')\s+((?:19|20)\d\d)\b(?!\s*г)', lambda m: m.group(1) + ' ' + ordinal_words(int(m.group(2)), 'gen'), text)
     text = re.sub(r'\b(\d{1,3})-(х|ти|ми|и)\b', _card_gen, text)
     text = re.sub(r'\b(\d{1,4})-(ый|ой|ий|ая|ое|ого|его|ому|ом|ем|ым|ых|ую|й|я|е|го|му|м|ю)\b', _suffixed, text)
-    text = re.sub(r'\b(\d+)[.,](\d+)\b', _decimal, text)
-    text = re.sub(r'\d+', lambda m: number_words(int(m.group(0)[:15])), text)
+    text = re.sub(r'(?<![\d.,])(\d{1,15})[.,](\d{1,3})(?!\d)(?![.,]\d)', _decimal, text)
+    text = re.sub(r'\d+', _integer, text)
     text = re.sub(r'\b(один|два)\s+(тысяч\w*)', lambda m: ('одна' if m.group(1) == 'один' else 'две') + ' ' + m.group(2), text)
     text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)                # MyAnimeList -> My Anime List
     text = re.sub(r"[A-Za-z][A-Za-z']*", _latin_word, text)

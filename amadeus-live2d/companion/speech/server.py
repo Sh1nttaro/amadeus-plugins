@@ -30,14 +30,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
     def _json(self, status: int, obj) -> None:
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
+    def _from_page(self) -> bool:
+        """Requests of web pages carry an Origin (or say where they come from); only the companion talks to us."""
+        if self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site") in ("cross-site", "same-site"):
+            self._json(403, {"error": "forbidden"})
+            return True
+        return False
+
     def do_GET(self) -> None:
+        if self._from_page():
+            return
         if self.path == "/health":
             self._json(200, {"ok": True})
             return
@@ -51,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self._from_page():
+            return
         if self.path == "/voices":
             # Register a user voice: body {"name", "model"}. The .bin must already be copied.
             try:

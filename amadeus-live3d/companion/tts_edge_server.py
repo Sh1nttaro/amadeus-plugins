@@ -9,6 +9,7 @@ POST /synthesize  {"text", "voice", "rate", "pitch"} -> audio/mpeg bytes or JSON
 import asyncio
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import edge_tts
@@ -27,25 +28,26 @@ async def synth_once(text, voice, rate, pitch):
     return bytes(out)
 
 
+ATTEMPT_S, TOTAL_S = 6, 10                                           # one try / all tries, seconds
+
+
 async def synth(text, voice, rate, pitch):
-    """The service now and then answers without audio, mostly when the pitch is shifted: try once
-    more as asked, then without the pitch shift, then without the rate change too."""
+    """The service now and then answers without audio: try again, then without the pitch shift. All
+    within TOTAL_S, so that one failing sentence never holds the answer up for long."""
     last = None
-    plans = [(rate, pitch), (rate, pitch), (rate, 0), (0, 0)]
-    seen = set()
-    for attempt, (r, p) in enumerate(plans):
-        if (r, p) in seen and attempt > 1:
-            continue
-        seen.add((r, p))
+    end = time.monotonic() + TOTAL_S
+    for r, p in ((rate, pitch), (rate, pitch), (rate, 0)):
+        left = end - time.monotonic()
+        if left < 1:
+            break
         try:
-            audio = await synth_once(text, voice, r, p)
+            audio = await asyncio.wait_for(synth_once(text, voice, r, p), min(ATTEMPT_S, left))
             if audio:
                 return audio
         except Exception as e:  # noqa: BLE001
             last = e
-        await asyncio.sleep(0.15 * (attempt + 1))
     if last:
-        raise last
+        raise last if str(last) else RuntimeError('Edge не ответил вовремя.')
     return b''
 
 
@@ -63,13 +65,24 @@ class H(BaseHTTPRequestHandler):
     def err(self, code, msg):
         self.send(code, json.dumps({'ok': False, 'error': msg}, ensure_ascii=False).encode('utf-8'), 'application/json; charset=utf-8')
 
+    def from_page(self):
+        """Requests of web pages carry an Origin (or say where they come from); only the companion talks to us."""
+        if self.headers.get('Origin') or self.headers.get('Sec-Fetch-Site') in ('cross-site', 'same-site'):
+            self.err(403, 'forbidden')
+            return True
+        return False
+
     def do_GET(self):
+        if self.from_page():
+            return None
         if self.path.startswith('/health'):
             self.send(200, b'{"ok": true}', 'application/json')
         else:
             self.err(404, 'not found')
 
     def do_POST(self):
+        if self.from_page():
+            return None
         if not self.path.startswith('/synthesize'):
             return self.err(404, 'not found')
         try:
@@ -78,7 +91,7 @@ class H(BaseHTTPRequestHandler):
             text = str(p.get('text') or '').strip()[:3000]
             if not text:
                 return self.err(400, 'Пустой текст.')
-            voice = p.get('voice') if p.get('voice') in VOICES else 'ru-RU-SvetlanaNeural'
+            voice = p.get('voice') if p.get('voice') in VOICES else 'en-US-AvaMultilingualNeural'
             rate = max(-50, min(50, int(round(float(p.get('rate') or 0)))))
             pitch = max(-50, min(50, int(round(float(p.get('pitch') or 0)))))
             audio = asyncio.run(synth(text, voice, rate, pitch))

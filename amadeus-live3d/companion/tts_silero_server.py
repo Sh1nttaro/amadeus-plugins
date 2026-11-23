@@ -28,7 +28,6 @@ MODEL = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ.get('AMADE
 RATE = 48000
 VOICES = ['xenia', 'baya', 'aidar', 'eugene']                       # kseniya left out: sounds bad
 state = {'model': None, 'error': None}
-recent = []                                                         # last phrases said (GET /recent, for checks)
 lock = threading.Lock()
 
 
@@ -68,8 +67,6 @@ def synthesize(text, voice, speed):
     said = normalize(text)
     if not re.search('[а-яё]', said, re.I):
         raise ValueError('Нечего произнести.')
-    recent.append({'text': text, 'said': said, 'voice': voice})
-    del recent[:-30]
     model = state['model']
     with lock:
         if abs(speed - 1) < 0.05:
@@ -107,16 +104,25 @@ class H(BaseHTTPRequestHandler):
     def err(self, code, msg):
         self.send(code, json.dumps({'ok': False, 'error': msg}, ensure_ascii=False).encode('utf-8'), 'application/json; charset=utf-8')
 
+    def from_page(self):
+        """Requests of web pages carry an Origin (or say where they come from); only the companion talks to us."""
+        if self.headers.get('Origin') or self.headers.get('Sec-Fetch-Site') in ('cross-site', 'same-site'):
+            self.err(403, 'forbidden')
+            return True
+        return False
+
     def do_GET(self):
+        if self.from_page():
+            return None
         if self.path.startswith('/health'):
             body = {'ok': True, 'ready': state['model'] is not None, 'error': state['error'], 'voices': VOICES}
             self.send(200, json.dumps(body).encode('utf-8'), 'application/json')
-        elif self.path.startswith('/recent'):
-            self.send(200, json.dumps(recent, ensure_ascii=False).encode('utf-8'), 'application/json; charset=utf-8')
         else:
             self.err(404, 'not found')
 
     def do_POST(self):
+        if self.from_page():
+            return None
         if not self.path.startswith('/synthesize'):
             return self.err(404, 'not found')
         try:

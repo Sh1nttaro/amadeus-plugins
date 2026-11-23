@@ -59,6 +59,10 @@ def register_voice(name, model=DEFAULT_MODEL) -> str:
     style_path = folder / "voices" / f"{clean}.bin"
     if not style_path.exists():
         raise SpeechError("Файл стиля голоса не найден.")
+    try:
+        style = _read_style(style_path)
+    except (OSError, ValueError) as error:
+        raise SpeechError("Это не стиль голоса Kokoro.") from error
     VOICES[clean] = model
     custom = _read_custom_voices()
     custom[clean] = model
@@ -69,8 +73,7 @@ def register_voice(name, model=DEFAULT_MODEL) -> str:
     except Exception:
         pass
     if _state and "styles" in _state:
-        import numpy as np
-        _state["styles"][clean] = np.fromfile(style_path, dtype=np.float32).reshape(-1, 256)
+        _state["styles"][clean] = style
     return clean
 FILES = ["config.json", "kokoro-config.json", "onnx/model_quantized.onnx", "onnx/model_dima_quantized.onnx",
          "voices/*.bin", "espeak-data/*", "espeak-data/**"]
@@ -99,7 +102,7 @@ def speakable(text: str) -> str:
 _SYMBOLS = [
     (re.compile(r"(\d)\s*%"), r"\1 процентов"), (re.compile(r"%"), " процентов"),
     (re.compile(r"\b(\d{1,2}):(\d{2})\b"), r"\1 \2"),            # 12:30 -> 12 30
-    (re.compile(r"(\d)\s*[–—]\s*(\d)"), r"от \1 до \2"),          # 3–5 -> от 3 до 5
+    (re.compile(r"(?<![\d.,–—-])(\d+(?:[.,]\d+)?)\s*[–—]\s*(\d+(?:[.,]\d+)?)(?![\d–—-])"), r"от \1 до \2"),          # 3–5 -> от 3 до 5
     (re.compile(r"№\s*"), "номер "), (re.compile(r"\s&\s"), " и "),
     (re.compile(r"(\d)\s*°C?"), r"\1 градусов"), (re.compile(r"(\d)\s*₽"), r"\1 рублей"),
     (re.compile(r"\$\s*(\d[\d.,]*)"), r"\1 долларов"),
@@ -150,6 +153,16 @@ def parts(text: str, size: int = 280) -> list[str]:
     return found
 
 
+def _read_style(path):
+    """The style vectors of a voice: rows of 256 floats (ValueError when the file is something else)."""
+    import numpy as np
+
+    data = np.fromfile(path, dtype=np.float32)
+    if not len(data) or len(data) % 256:
+        raise ValueError("not a Kokoro voice style")
+    return data.reshape(-1, 256)
+
+
 def _load():
     if not _state:
         import numpy as np
@@ -168,10 +181,11 @@ def _load():
         except Exception as error:
             raise SpeechError(f"Не удалось загрузить модель голоса: {str(error)[:200]}") from error
         styles = {}
-        for voice in VOICES:
-            style_path = folder / "voices" / f"{voice}.bin"
-            if style_path.exists():
-                styles[voice] = np.fromfile(style_path, dtype=np.float32).reshape(-1, 256)
+        for voice in list(VOICES):
+            try:
+                styles[voice] = _read_style(folder / "voices" / f"{voice}.bin")
+            except (OSError, ValueError):
+                pass
         _state.update(
             folder=folder, g2p=g2p, sessions={},
             vocab=json.loads((folder / "config.json").read_text(encoding="utf-8"))["vocab"],
@@ -234,7 +248,7 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0, rate: 
     if reason := unavailable():
         raise SpeechError(reason)
     if voice not in VOICES:
-        raise SpeechError("Такого голоса нет.")
+        register_voice(voice)                               # a .bin put into the folder while the server was off
     if rate not in RATES:
         raise SpeechError(f"Частота {rate} Гц не поддерживается.")
     said = speakable(text)[:MAX_TEXT]

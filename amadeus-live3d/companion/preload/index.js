@@ -18,7 +18,7 @@ contextBridge.exposeInMainWorld('amadeus', {
   menu: (state) => ipcRenderer.send('pet:menu', state),
   log: (msg) => ipcRenderer.send('pet:log', String(msg)),
   synthesize: (req) => ipcRenderer.invoke('voice:synthesize', req),
-  voiceListen: (wav, follow, onlyStop) => ipcRenderer.invoke('voice:listen', wav, !!follow, !!onlyStop),
+  voiceListen: (wav, follow, onlyStop, session) => ipcRenderer.invoke('voice:listen', wav, !!follow, !!onlyStop, String(session || '')),
   voiceOnset: () => ipcRenderer.send('voice:onset'),
   voiceTurn: (wav) => ipcRenderer.invoke('voice:turn', wav),
   onVoiceToggle: (fn) => subscribe('voice:toggle', fn),
